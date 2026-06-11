@@ -2,6 +2,13 @@
 //! calls `run()`. Splitting into a lib lets `cargo test` exercise the pure core
 //! (collector state machine, aggregation, migrations) without the OS watchers.
 
+// The `objc` 0.2 crate uses a legacy `cfg(feature = "cargo-clippy")` check in
+// its `msg_send!` / `class!` macros that trips the newer `unexpected_cfgs`
+// lint. The lint fires inside the expanded macro, so it has to be allowed at
+// the crate root (module-level `#![allow]` does not reach into upstream
+// macro expansions).
+#![allow(unexpected_cfgs)]
+
 pub mod blocker;
 pub mod collector;
 pub mod commands;
