@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/anandsundaramoorthysa/System-Trace/security/policy
+    about: Please do not file security issues publicly. Email the maintainer instead.
+  - name: Question or general discussion
+    url: https://github.com/anandsundaramoorthysa/System-Trace/discussions
+    about: For usage questions and ideas, use Discussions instead of Issues.

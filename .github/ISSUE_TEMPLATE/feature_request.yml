@@ -1,0 +1,62 @@
+name: Feature request
+description: Suggest a new feature or improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please describe the problem first, then the
+        feature you have in mind. New features must respect the project's core
+        principles: local-first, private (no telemetry), cross-platform, and
+        no emoji.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What user need or pain point does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: The proposed feature
+      description: Describe how the feature would work from the user's point of view.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about and why they fall short.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which platforms should this support?
+      multiple: true
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+
+  - type: textarea
+    id: extras
+    attributes:
+      label: Additional context
+      description: Mockups, links to similar features in other apps, related issues, etc.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: This feature keeps all activity data on the user's device (no cloud, no telemetry).
+          required: true

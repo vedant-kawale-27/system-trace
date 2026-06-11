@@ -27,6 +27,7 @@ Website: **https://system-trace.pages.dev**
 - [How It Works](#how-it-works)
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
+- [SSoC 2026](#ssoc-2026)
 - [Contributing](#contributing)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -193,6 +194,26 @@ System-Trace/
 | Styling | Tailwind CSS |
 | Package manager | pnpm |
 | Testing | Playwright (UI), cargo test (core) |
+
+## SSoC 2026
+
+System Trace is a participating project in
+[Social Summer of Code (SSoC) Season 5 - 2026](https://socialsummerofcode.com/).
+
+If you are an SSoC26 contributor, look for issues tagged
+[`ssoc26`](https://github.com/anandsundaramoorthysa/System-Trace/issues?q=is%3Aissue+is%3Aopen+label%3Assoc26)
+and pick one that matches your skill level: `good first issue`, `easy`, `medium`,
+or `hard`. Each issue has a clear scope and acceptance criteria.
+
+Before starting work:
+
+1. Comment on the issue to claim it (one issue, one contributor).
+2. Read [CONTRIBUTING.md](CONTRIBUTING.md) - especially the principles and the
+   IPC contract section.
+3. Keep your PR focused on the issue you claimed. One issue, one pull request.
+
+Coding phase: 1 June 2026 - 1 August 2026. Reviews are usually within two or
+three days; if a PR sits longer, feel free to ping in the PR comments.
 
 ## Contributing
 
