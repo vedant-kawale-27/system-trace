@@ -203,7 +203,8 @@ Schema is created and migrated by a small versioned migration runner (a
 Commands (UI calls Rust; all return typed results, never raw DB rows):
 
 - `get_today_overview()` -> { total_ms, top_apps[], by_category[], by_hour[] }
-- `get_range_overview(from, to)` -> weekly/monthly aggregates
+- `get_day_overview(day)` -> same shape as today, for any past day (Reports Day mode)
+- `get_range_overview(from, to)` -> aggregates for any range (Reports Week / Month mode)
 - `get_apps()` / `set_app_category(app_id, category_id)`
 - `get_categories()` / `upsert_category(...)` / `delete_category(id)`
 - `get_settings()` / `set_setting(key, value)`
@@ -235,8 +236,10 @@ Events (Rust pushes to UI):
 
 Screen inventory (MVP): Dashboard (hero "Screen Time Today", stat cards, daily
 time-series, top apps, category split), Apps (list + re-categorize), Reports
-(weekly/monthly), Settings (theme, idle threshold, title capture toggle, retention,
-exclusions, export/import, wipe), plus Onboarding (permissions + intro).
+(Day / Week / Month history explorer with prev / next stepper, reset-to-present
+chip, and keyboard arrow navigation), Settings (theme, idle threshold, title
+capture toggle, retention, exclusions, export/import, wipe), plus Onboarding
+(permissions + intro).
 
 ## 10. Phase 2-4 Architecture Hooks (designed now, built later)
 

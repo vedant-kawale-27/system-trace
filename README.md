@@ -64,8 +64,12 @@ The marketing website lives in a separate repository
   still counts videos and meetings (no "watching a video reads as idle" problem).
 - **Local-first storage:** a local SQLite database with daily and weekly rollups. No cloud,
   no account, no telemetry.
-- **Clear dashboard:** a "Screen Time Today" hero, top apps, category split, an hour-by-hour
-  timeline, and weekly and monthly reports.
+- **Clear dashboard:** a "Screen Time Today" hero, top apps, category split, and an
+  hour-by-hour timeline.
+- **History explorer:** walk back through any past **day**, **week**, or **month**.
+  Day view shows that day's hourly chart, top apps, categories, and longest session;
+  week and month views show the daily-usage bars and aggregates for the picked period.
+  Left and right arrow keys step through history.
 - **Neutral categories:** group apps your way, with optional productivity scoring.
 - **Per-app daily limits:** set a cap and choose how strict the nudge is when you reach it.
 - **Focus mode:** start a focus session that blocks distracting apps and websites.

@@ -49,6 +49,11 @@ desktop screen-time tracker built with Tauri 2, Rust, React, and SQLite.
 - Daily and weekly summary delivery with catch-up markers so missed
   summaries are not silently skipped.
 - Per-day and per-range totals; weekly screen-time report view.
+- **History explorer** in the Reports view: walk back through any past
+  **Day**, **Week**, or **Month** with a prev / next date stepper, a
+  reset-to-present chip, and left / right arrow key navigation. Day mode
+  shows the same drill-down as the Dashboard (hourly chart, top apps,
+  categories, longest session, app switches) for any past day.
 - System tray, single-instance enforcement, and the dialog, autostart, and
   notification Tauri plugins.
 - "Launch at login" setting applied live through the autolaunch plugin.

@@ -27,7 +27,8 @@ private app that does what today's tools only do in fragments.
 | Automatic time tracking | Records active app (and optional window title) and duration | G2, G3 |
 | Smart idle detection | Excludes time away; still counts media/meeting time | G3 |
 | Local-first storage | All data in local SQLite, never uploaded | G3, G8 |
-| Polished dashboard | Clean charts: daily/weekly time, top apps, trends | G3, G7 |
+| Polished dashboard | Clean charts: today's hourly time, top apps, categories | G3, G7 |
+| History explorer | Walk past **day**, **week**, or **month** with full drill-down | G3, G7 |
 | Neutral categories | Work, Social, Entertainment, Dev, etc.; optional scoring | G7 |
 | Dark and light themes | Signal palette, both modes | G7 |
 | Per-app daily limits | Set a daily cap; choose how strict the stop is | G4 |
@@ -91,7 +92,11 @@ The trustworthy foundation. Fills G1, G3, G7, G8.
 - Active app tracking; optional, off-by-default window-title tracking.
 - Local SQLite storage, daily/weekly aggregation, configurable raw retention
   (default 90 days).
-- Dashboard: "Screen Time Today" hero, top apps, daily/weekly trends.
+- Dashboard: "Screen Time Today" hero, top apps, categories, hourly chart.
+- Reports view: Day / Week / Month history explorer with prev / next stepper,
+  reset-to-present chip, and keyboard arrow navigation. Day mode shows the
+  same drill-down as the Dashboard for any past day; Week and Month show
+  daily-usage bars plus aggregates for the picked period.
 - Neutral categories from a local preset list, with manual re-tagging.
 - Dark and light themes.
 - Privacy basics: export (CSV/JSON), import/merge, delete/reset, exclusions
