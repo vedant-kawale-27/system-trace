@@ -36,11 +36,34 @@ export async function checkForUpdate(): Promise<UpdateInfo> {
     current = await getVersion();
   }
 
-  const res = await fetch(RELEASES_API, {
-    headers: { Accept: "application/vnd.github+json" },
-  });
-  if (!res.ok) throw new Error(`GitHub returned ${res.status}`);
-  const json = (await res.json()) as { tag_name?: string; html_url?: string };
+  // Bound the whole request - headers AND body - so a hung network or a server
+  // that sends headers then stalls the body never leaves the button spinning.
+  // The abort signal aborts an in-flight `res.json()` body read too, so the
+  // timeout must stay armed until parsing finishes.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  let json: { tag_name?: string; html_url?: string };
+  try {
+    const res = await fetch(RELEASES_API, {
+      headers: { Accept: "application/vnd.github+json" },
+      signal: controller.signal,
+    });
+    if (res.status === 403) {
+      throw new Error("GitHub rate limit reached. Please try again in a few minutes.");
+    }
+    if (!res.ok) throw new Error(`GitHub returned ${res.status}.`);
+    json = (await res.json()) as { tag_name?: string; html_url?: string };
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("the request timed out. Check your connection and retry.");
+    }
+    // Re-throw our own explicit Errors (403, non-ok) untouched; only wrap the
+    // opaque network/transport failures into a friendly message.
+    if (e instanceof Error && /^(GitHub |the request )/.test(e.message)) throw e;
+    throw new Error("could not reach GitHub. Check your connection and retry.");
+  } finally {
+    clearTimeout(timeout);
+  }
   const latest = (json.tag_name ?? "0.0.0").replace(/^v/, "");
 
   return {

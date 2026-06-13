@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Plus,
   Trash2,
@@ -16,6 +16,7 @@ import {
   backupDatabase,
   exportData,
   getExclusions,
+  getHotkeyStatus,
   getSettings,
   importData,
   isTauri,
@@ -85,15 +86,35 @@ export function Settings() {
   const [status, setStatus] = useState<string | null>(null);
   const [exportFrom, setExportFrom] = useState("");
   const [exportTo, setExportTo] = useState("");
+  const [hotkeyOk, setHotkeyOk] = useState(true);
+  const [checking, setChecking] = useState(false);
+  const statusTimer = useRef<number | null>(null);
 
   useEffect(() => {
     getSettings().then(setS).catch(() => {});
     getExclusions().then(setExclusions).catch(() => {});
+    getHotkeyStatus().then(setHotkeyOk).catch(() => {});
+    return () => {
+      if (statusTimer.current !== null) window.clearTimeout(statusTimer.current);
+    };
   }, []);
 
-  function flash(msg: string) {
+  // Show a toast. `sticky` keeps it up until the next flash (used for the
+  // in-progress message of a slow request); otherwise it auto-dismisses. Each
+  // call cancels the previous timer so a stale one can never wipe a fresh
+  // message - the bug that made "Check for updates" look like it did nothing.
+  function flash(msg: string, sticky = false) {
+    if (statusTimer.current !== null) {
+      window.clearTimeout(statusTimer.current);
+      statusTimer.current = null;
+    }
     setStatus(msg);
-    window.setTimeout(() => setStatus(null), 4000);
+    if (!sticky) {
+      statusTimer.current = window.setTimeout(() => {
+        setStatus(null);
+        statusTimer.current = null;
+      }, 4000);
+    }
   }
 
   function setBool(key: SettingKey & keyof SettingsModel, val: boolean) {
@@ -176,14 +197,19 @@ export function Settings() {
     if (!ok) return;
     try {
       await restoreDatabase(picked);
-      flash("Restored. Please quit and reopen System Trace to load the data.");
+      flash("Restored. Your backup data is loaded and live now.");
     } catch (e) {
-      flash(String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      flash(`Restore failed: ${msg}`);
     }
   }
 
   async function doCheckUpdate() {
-    flash("Checking for updates...");
+    if (checking) return;
+    setChecking(true);
+    // Sticky: this stays up for the whole request (which can take seconds) so
+    // it is never cleared before the result arrives.
+    flash("Checking for updates...", true);
     try {
       const info = await checkForUpdate();
       if (info.update_available) {
@@ -192,7 +218,10 @@ export function Settings() {
         flash(`You are on the latest version (v${info.current}).`);
       }
     } catch (e) {
-      flash(`Could not check for updates: ${String(e)}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      flash(`Could not check for updates: ${msg}`);
+    } finally {
+      setChecking(false);
     }
   }
 
@@ -515,9 +544,20 @@ export function Settings() {
       <Section title="Updates and shortcuts">
         <Row
           title="Pause / resume hotkey"
-          description="Toggle tracking from anywhere with this global shortcut."
+          description={
+            hotkeyOk
+              ? "Toggle tracking from anywhere with this global shortcut."
+              : "Another app is already using this shortcut, so it is unavailable. You can still pause from the top bar."
+          }
           control={
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg px-2.5 py-1.5 text-label text-text-muted">
+            <span
+              className={cx(
+                "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-label",
+                hotkeyOk
+                  ? "border-border bg-bg text-text-muted"
+                  : "border-negative/50 bg-negative/10 text-negative line-through",
+              )}
+            >
               <Keyboard className="h-4 w-4" aria-hidden /> Ctrl + Alt + P
             </span>
           }
@@ -529,9 +569,17 @@ export function Settings() {
             <button
               type="button"
               onClick={doCheckUpdate}
-              className="flex items-center gap-1.5 rounded-md border border-border bg-surface px-3 py-1.5 text-body-strong text-text hover:bg-surface-2"
+              disabled={checking}
+              className={cx(
+                "flex items-center gap-1.5 rounded-md border border-border bg-surface px-3 py-1.5 text-body-strong text-text hover:bg-surface-2",
+                checking && "cursor-not-allowed opacity-60",
+              )}
             >
-              <RefreshCw className="h-4 w-4" aria-hidden /> Check
+              <RefreshCw
+                className={cx("h-4 w-4", checking && "animate-spin")}
+                aria-hidden
+              />{" "}
+              {checking ? "Checking..." : "Check"}
             </button>
           }
         />

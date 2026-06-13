@@ -2,8 +2,9 @@
 //!
 //! Active app via `NSWorkspace.frontmostApplication` (bundle id as app_key,
 //! localized name for display). Idle via Quartz `CGEventSourceSecondsSinceLastEventType`.
-//! Window titles need the Accessibility API and the user's permission; they are
-//! left as None for now (app-level tracking works without that grant).
+//! Frontmost window title via the Accessibility API (requires the user's
+//! Accessibility permission; yields `None` without it). Media-playing via
+//! CoreAudio and screen-lock via the window-server session dictionary.
 //!
 //! NOTE: this file is `#[cfg(target_os = "macos")]` and is therefore compiled and
 //! verified by the macOS CI job, not on a Windows dev box.
@@ -22,6 +23,162 @@ use objc::{class, msg_send, sel, sel_impl};
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn CGEventSourceSecondsSinceLastEventType(state_id: u32, event_type: u32) -> f64;
+}
+
+// CoreGraphics session dictionary (used to detect a locked screen) and CoreAudio
+// (used to detect audio actually playing). Both are best-effort and fully
+// guarded; any failure degrades to "unknown" (false).
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGSessionCopyCurrentDictionary() -> id;
+}
+
+// Accessibility (AX) API for the frontmost window title. Requires the user to
+// grant Accessibility permission (System Settings -> Privacy & Security ->
+// Accessibility); without it the calls return an error and we yield `None`.
+type AXUIElementRef = *const std::os::raw::c_void;
+type CFTypeRef = *const std::os::raw::c_void;
+type CFStringRef = *const std::os::raw::c_void;
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    fn AXUIElementCopyAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: *mut CFTypeRef,
+    ) -> i32;
+    fn CFRelease(cf: CFTypeRef);
+    fn CFStringCreateWithCString(
+        alloc: CFTypeRef,
+        c_str: *const c_char,
+        encoding: u32,
+    ) -> CFStringRef;
+    fn CFStringGetCStringPtr(s: CFStringRef, encoding: u32) -> *const c_char;
+    fn CFStringGetCString(s: CFStringRef, buffer: *mut c_char, size: isize, encoding: u32) -> bool;
+}
+
+const KCF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+/// Make a CFString from a Rust &str (caller must CFRelease).
+unsafe fn cfstr(s: &str) -> CFStringRef {
+    let c = std::ffi::CString::new(s).unwrap();
+    CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), KCF_STRING_ENCODING_UTF8)
+}
+
+/// Convert a CFStringRef to a Rust String.
+unsafe fn cfstring_to_rust(s: CFStringRef) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    let ptr = CFStringGetCStringPtr(s, KCF_STRING_ENCODING_UTF8);
+    if !ptr.is_null() {
+        return Some(CStr::from_ptr(ptr).to_string_lossy().into_owned());
+    }
+    let mut buf = vec![0i8; 1024];
+    if CFStringGetCString(
+        s,
+        buf.as_mut_ptr(),
+        buf.len() as isize,
+        KCF_STRING_ENCODING_UTF8,
+    ) {
+        Some(CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+/// Frontmost window title of the app with the given pid, via the AX API.
+unsafe fn ax_window_title(pid: i32) -> Option<String> {
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return None;
+    }
+    let mut title: Option<String> = None;
+    let focused_attr = cfstr("AXFocusedWindow");
+    let mut window: CFTypeRef = std::ptr::null();
+    if AXUIElementCopyAttributeValue(app, focused_attr, &mut window) == 0 && !window.is_null() {
+        let title_attr = cfstr("AXTitle");
+        let mut value: CFTypeRef = std::ptr::null();
+        if AXUIElementCopyAttributeValue(window as AXUIElementRef, title_attr, &mut value) == 0
+            && !value.is_null()
+        {
+            title = cfstring_to_rust(value as CFStringRef).filter(|s| !s.is_empty());
+            CFRelease(value);
+        }
+        CFRelease(title_attr);
+        CFRelease(window);
+    }
+    CFRelease(focused_attr);
+    CFRelease(app);
+    title
+}
+
+#[repr(C)]
+struct AudioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+#[link(name = "CoreAudio", kind = "framework")]
+extern "C" {
+    fn AudioObjectGetPropertyData(
+        object_id: u32,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const std::os::raw::c_void,
+        data_size: *mut u32,
+        data: *mut std::os::raw::c_void,
+    ) -> i32;
+}
+
+/// Build a CoreAudio four-char-code selector from a 4-byte tag.
+const fn fourcc(b: &[u8; 4]) -> u32 {
+    ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
+}
+
+const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
+
+/// Whether any audio is currently being rendered by the default output device.
+unsafe fn macos_audio_running() -> bool {
+    // 1. Resolve the default output device id.
+    let default_out_addr = AudioObjectPropertyAddress {
+        selector: fourcc(b"dOut"), // kAudioHardwarePropertyDefaultOutputDevice
+        scope: fourcc(b"glob"),    // kAudioObjectPropertyScopeGlobal
+        element: 0,                // kAudioObjectPropertyElementMain
+    };
+    let mut device_id: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = AudioObjectGetPropertyData(
+        K_AUDIO_OBJECT_SYSTEM_OBJECT,
+        &default_out_addr,
+        0,
+        std::ptr::null(),
+        &mut size,
+        &mut device_id as *mut u32 as *mut _,
+    );
+    if status != 0 || device_id == 0 {
+        return false;
+    }
+
+    // 2. Ask whether that device is running somewhere (i.e. audio is flowing).
+    let running_addr = AudioObjectPropertyAddress {
+        selector: fourcc(b"gone"), // kAudioDevicePropertyDeviceIsRunningSomewhere
+        scope: fourcc(b"glob"),
+        element: 0,
+    };
+    let mut running: u32 = 0;
+    let mut rsize = std::mem::size_of::<u32>() as u32;
+    let status = AudioObjectGetPropertyData(
+        device_id,
+        &running_addr,
+        0,
+        std::ptr::null(),
+        &mut rsize,
+        &mut running as *mut u32 as *mut _,
+    );
+    status == 0 && running != 0
 }
 
 #[derive(Default)]
@@ -67,11 +224,27 @@ impl Watcher for MacWatcher {
             let app_key = nsstring_to_string(bundle)
                 .or_else(|| app_name.clone())
                 .unwrap_or_else(|| "unknown".to_string());
+            // Resolve the .app bundle path (best-effort) so the UI can pull a
+            // real icon from it.
+            let app_path = {
+                let url: id = msg_send![app, bundleURL];
+                if url == nil {
+                    None
+                } else {
+                    let p: id = msg_send![url, path];
+                    nsstring_to_string(p)
+                }
+            };
+            // Frontmost window title via the Accessibility API. Returns None
+            // unless the user granted Accessibility permission; the collector
+            // only keeps it when title capture is enabled anyway.
+            let pid: i32 = msg_send![app, processIdentifier];
+            let title = ax_window_title(pid);
             Some(ActiveWindow {
                 app_name: app_name.unwrap_or_else(|| app_key.clone()),
                 app_key,
-                // Title needs the Accessibility permission; deferred.
-                title: None,
+                title,
+                app_path,
             })
         }
     }
@@ -82,6 +255,34 @@ impl Watcher for MacWatcher {
             (secs * 1000.0) as u64
         } else {
             0
+        }
+    }
+
+    fn is_media_playing(&mut self) -> bool {
+        unsafe { macos_audio_running() }
+    }
+
+    fn session_locked(&mut self) -> bool {
+        // The window-server session dictionary carries CGSSessionScreenIsLocked
+        // when the screen is locked. Best-effort; any failure returns false.
+        unsafe {
+            let dict: id = CGSessionCopyCurrentDictionary();
+            if dict == nil {
+                return false;
+            }
+            let key: id = msg_send![class!(NSString),
+                stringWithUTF8String: b"CGSSessionScreenIsLocked\0".as_ptr() as *const c_char];
+            let val: id = msg_send![dict, objectForKey: key];
+            let locked = if val == nil {
+                false
+            } else {
+                let b: bool = msg_send![val, boolValue];
+                b
+            };
+            // CGSessionCopyCurrentDictionary returns a +1 reference (toll-free
+            // bridged to NSDictionary); balance it.
+            let _: () = msg_send![dict, release];
+            locked
         }
     }
 }

@@ -184,6 +184,39 @@ pub struct CategoryGoalInput {
     pub kind: GoalKind,
 }
 
+/// A daily target for a single app, with today's progress and its
+/// consecutive-days streak (embedded so the UI needs one round-trip).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppGoal {
+    pub app_id: i64,
+    pub app_key: String,
+    pub display_name: String,
+    pub daily_ms: i64,
+    pub kind: GoalKind,
+    /// Today's actual usage of this app so the UI can show progress.
+    pub today_ms: i64,
+    /// Consecutive days the goal has been met (bounded by tracked history).
+    pub streak_days: i64,
+}
+
+/// Argument shape for `set_app_goal`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppGoalInput {
+    pub app_id: i64,
+    pub daily_ms: i64,
+    pub kind: GoalKind,
+}
+
+/// Raw icon pixels for an app: RGBA, row-major, top-down. The frontend paints
+/// these onto a canvas. Absent when no real icon could be extracted (the UI
+/// then shows its deterministic letter avatar).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppIcon {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 /// A productivity Focus Score for a single day. The score is 0..=100,
 /// computed from productive_ms / (productive_ms + distracting_ms). Neutral
 /// time (uncategorized or category.productive == None) does not affect the

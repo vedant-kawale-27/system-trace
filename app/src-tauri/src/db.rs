@@ -34,6 +34,72 @@ pub fn open(path: &std::path::Path) -> DbResult<Connection> {
     Ok(conn)
 }
 
+/// Open the live database **in memory**, loading it from the encrypted snapshot
+/// at `enc_path` if one exists, or one-time-migrating a legacy plaintext file at
+/// `legacy_plain`. Migrations then run as usual. Because the working database
+/// only ever lives in memory, no plaintext database is written to disk.
+pub fn open_encrypted(
+    enc_path: &std::path::Path,
+    key: &[u8; 32],
+    legacy_plain: &std::path::Path,
+) -> DbResult<Connection> {
+    let mut conn = Connection::open_in_memory().map_err(map_err)?;
+    if enc_path.exists() {
+        let blob = std::fs::read(enc_path).map_err(map_err)?;
+        let bytes = crate::crypto::decrypt(key, &blob)?;
+        deserialize_into(&mut conn, &bytes)?;
+    } else if legacy_plain.exists() {
+        // Pre-encryption installs have a plaintext SQLite file; its raw bytes
+        // are a valid serialized database, so load and (later) re-encrypt them.
+        let bytes = std::fs::read(legacy_plain).map_err(map_err)?;
+        if !bytes.is_empty() {
+            deserialize_into(&mut conn, &bytes)?;
+        }
+    }
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(map_err)?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+/// Load a serialized SQLite image (`bytes`) into an open in-memory connection.
+/// `sqlite3_deserialize` takes ownership of an `sqlite3_malloc`-allocated buffer,
+/// so we allocate one, copy the bytes in, and hand it over.
+fn deserialize_into(conn: &mut Connection, bytes: &[u8]) -> DbResult<()> {
+    use std::ptr::NonNull;
+    unsafe {
+        let sz = bytes.len();
+        let ptr = rusqlite::ffi::sqlite3_malloc64(sz as u64) as *mut u8;
+        let nn = NonNull::new(ptr).ok_or_else(|| "sqlite3_malloc failed".to_string())?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, sz);
+        let owned = rusqlite::serialize::OwnedData::from_raw_nonnull(nn, sz);
+        conn.deserialize(rusqlite::DatabaseName::Main, owned, false)
+            .map_err(map_err)?;
+    }
+    Ok(())
+}
+
+/// Write an encrypted snapshot of the in-memory database to `enc_path`. Atomic:
+/// writes a temp sibling then renames over the target so a crash mid-write can
+/// never leave a half-written (unreadable) snapshot.
+pub fn snapshot_encrypted(
+    conn: &Connection,
+    enc_path: &std::path::Path,
+    key: &[u8; 32],
+) -> DbResult<()> {
+    let data = conn
+        .serialize(rusqlite::DatabaseName::Main)
+        .map_err(map_err)?;
+    let blob = crate::crypto::encrypt(key, &data)?;
+    if let Some(dir) = enc_path.parent() {
+        std::fs::create_dir_all(dir).map_err(map_err)?;
+    }
+    let tmp = enc_path.with_extension("enc.tmp");
+    std::fs::write(&tmp, &blob).map_err(map_err)?;
+    std::fs::rename(&tmp, enc_path).map_err(map_err)?;
+    Ok(())
+}
+
 /// Idempotent schema creation. Versioned via the `setting` table.
 pub fn migrate(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(
@@ -94,6 +160,11 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             daily_ms       INTEGER NOT NULL,
             kind           TEXT NOT NULL CHECK (kind IN ('under','over'))
         );
+        CREATE TABLE IF NOT EXISTS app_goal (
+            app_id    INTEGER PRIMARY KEY REFERENCES app(id) ON DELETE CASCADE,
+            daily_ms  INTEGER NOT NULL,
+            kind      TEXT NOT NULL CHECK (kind IN ('under','over'))
+        );
         CREATE TABLE IF NOT EXISTS focus_session (
             id        INTEGER PRIMARY KEY,
             start_ms  INTEGER NOT NULL,
@@ -111,6 +182,8 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
         "ALTER TABLE block_rule ADD COLUMN schedule_enabled INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE block_rule ADD COLUMN schedule_start INTEGER",
         "ALTER TABLE block_rule ADD COLUMN schedule_end INTEGER",
+        // Executable / bundle path, used to extract the app's real OS icon.
+        "ALTER TABLE app ADD COLUMN exe_path TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -169,11 +242,22 @@ fn local_hour(ms: i64) -> u8 {
 
 /// UTC unix-millis bounds [start, end) of a local calendar date.
 fn day_bounds(date: NaiveDate) -> (i64, i64) {
-    let start = Local
-        .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
-        .single()
-        .map(|dt| dt.timestamp_millis())
-        .unwrap_or(0);
+    let midnight = date.and_hms_opt(0, 0, 0).unwrap();
+    let start = match Local.from_local_datetime(&midnight) {
+        chrono::LocalResult::Single(dt) => dt.timestamp_millis(),
+        // Clocks fell back: midnight happened twice; the earlier instant is the
+        // true start of the day.
+        chrono::LocalResult::Ambiguous(earlier, _later) => earlier.timestamp_millis(),
+        // Clocks sprang forward *at* midnight, so 00:00 never existed locally.
+        // Use the first instant that did - one hour later - instead of falling
+        // back to the Unix epoch (which made the day's drill-down scan from
+        // 1970 and mix in unrelated events).
+        chrono::LocalResult::None => Local
+            .from_local_datetime(&(midnight + Duration::hours(1)))
+            .earliest()
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or_else(|| midnight.and_utc().timestamp_millis()),
+    };
     let end = start + Duration::days(1).num_milliseconds();
     (start, end)
 }
@@ -400,6 +484,122 @@ pub fn remove_category_goal(conn: &Connection, category_id: i64) -> DbResult<()>
     Ok(())
 }
 
+/// Consecutive days an app goal has been met, bounded by tracked history so a
+/// brand-new "under" goal doesn't report a streak stretching into empty days.
+fn app_goal_streak(
+    conn: &Connection,
+    app_id: i64,
+    daily_ms: i64,
+    kind: GoalKind,
+    earliest_day: Option<&str>,
+) -> DbResult<i64> {
+    let mut streak = 0i64;
+    for offset in 0..366 {
+        let day = (Local::now() - Duration::days(offset))
+            .format("%Y-%m-%d")
+            .to_string();
+        match earliest_day {
+            Some(first) if day.as_str() >= first => {}
+            _ => break,
+        }
+        let used: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_ms), 0) FROM daily_app_usage
+                 WHERE app_id = ?1 AND day = ?2",
+                params![app_id, day],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let met = match kind {
+            GoalKind::Under => used <= daily_ms,
+            GoalKind::Over => used >= daily_ms,
+        };
+        if !met {
+            // Today may be incomplete; for "over" goals don't break the streak
+            // just because today's target isn't reached yet.
+            if offset == 0 && matches!(kind, GoalKind::Over) {
+                continue;
+            }
+            break;
+        }
+        streak += 1;
+    }
+    Ok(streak)
+}
+
+pub fn get_app_goals(conn: &Connection) -> DbResult<Vec<AppGoal>> {
+    let day = today_key();
+    let mut stmt = conn
+        .prepare(
+            "SELECT g.app_id, a.app_key, a.display_name, g.daily_ms, g.kind,
+                    COALESCE(d.total_ms, 0) AS today_ms
+             FROM app_goal g
+             JOIN app a ON a.id = g.app_id
+             LEFT JOIN daily_app_usage d ON d.app_id = g.app_id AND d.day = ?1
+             ORDER BY a.display_name COLLATE NOCASE",
+        )
+        .map_err(map_err)?;
+    let base = stmt
+        .query_map(params![day], |r| {
+            let kind_str: String = r.get(4)?;
+            let kind = match kind_str.as_str() {
+                "over" => GoalKind::Over,
+                _ => GoalKind::Under,
+            };
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                kind,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(map_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+
+    let earliest_day: Option<String> = conn
+        .query_row("SELECT MIN(day) FROM daily_app_usage", [], |r| r.get(0))
+        .map_err(map_err)?;
+
+    let mut out = Vec::with_capacity(base.len());
+    for (app_id, app_key, display_name, daily_ms, kind, today_ms) in base {
+        let streak_days = app_goal_streak(conn, app_id, daily_ms, kind, earliest_day.as_deref())?;
+        out.push(AppGoal {
+            app_id,
+            app_key,
+            display_name,
+            daily_ms,
+            kind,
+            today_ms,
+            streak_days,
+        });
+    }
+    Ok(out)
+}
+
+pub fn set_app_goal(conn: &Connection, input: &AppGoalInput) -> DbResult<()> {
+    let kind = match input.kind {
+        GoalKind::Under => "under",
+        GoalKind::Over => "over",
+    };
+    conn.execute(
+        "INSERT INTO app_goal (app_id, daily_ms, kind)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(app_id) DO UPDATE SET daily_ms = excluded.daily_ms, kind = excluded.kind",
+        params![input.app_id, input.daily_ms, kind],
+    )
+    .map_err(map_err)?;
+    Ok(())
+}
+
+pub fn remove_app_goal(conn: &Connection, app_id: i64) -> DbResult<()> {
+    conn.execute("DELETE FROM app_goal WHERE app_id = ?1", params![app_id])
+        .map_err(map_err)?;
+    Ok(())
+}
+
 /// Roll up today's usage into productive / distracting / neutral buckets based
 /// on the category's `productive` flag. Score is 0..=100, defined as
 /// productive_ms / (productive_ms + distracting_ms); neutral time does not
@@ -615,6 +815,30 @@ pub fn range_overview(conn: &Connection, from: &str, to: &str) -> DbResult<Range
 }
 
 /* ----------------------------- apps + categories -------------------------- */
+
+/// Remember an app's executable / bundle path (for icon extraction). Only
+/// fills it in when we don't already have one, to avoid per-tick writes.
+pub fn set_app_path(conn: &Connection, app_key: &str, path: &str) -> DbResult<()> {
+    conn.execute(
+        "UPDATE app SET exe_path = ?2
+         WHERE app_key = ?1 AND (exe_path IS NULL OR exe_path = '')",
+        params![app_key, path],
+    )
+    .map_err(map_err)?;
+    Ok(())
+}
+
+/// The stored executable / bundle path for an app, if known.
+pub fn get_app_path(conn: &Connection, app_key: &str) -> DbResult<Option<String>> {
+    let mut stmt = conn
+        .prepare("SELECT exe_path FROM app WHERE app_key = ?1")
+        .map_err(map_err)?;
+    let mut rows = stmt.query(params![app_key]).map_err(map_err)?;
+    match rows.next().map_err(map_err)? {
+        Some(row) => row.get::<_, Option<String>>(0).map_err(map_err),
+        None => Ok(None),
+    }
+}
 
 pub fn get_apps(conn: &Connection) -> DbResult<Vec<AppInfo>> {
     let mut stmt = conn
@@ -1209,7 +1433,10 @@ pub fn get_limits(conn: &Connection) -> DbResult<Vec<LimitView>> {
                 daily_ms: daily,
                 used_ms: used,
                 strictness: parse_strictness(&st),
-                exceeded: used >= daily,
+                // A limit of 0 ms (or any non-positive value) is not a real
+                // cap, so it must never count as "exceeded" - otherwise a
+                // freshly-created or zero limit fires at 0 usage.
+                exceeded: daily > 0 && used >= daily,
             })
         })
         .map_err(map_err)?;
@@ -1388,6 +1615,27 @@ pub fn enabled_website_block_patterns(conn: &Connection) -> DbResult<Vec<String>
         .collect())
 }
 
+/// Snapshot the collector uses to keep the system hosts file in sync with
+/// website rules each loop. Returns `(feature_in_use, in_force_domains)` where
+/// `feature_in_use` is true when at least one website rule is enabled (so the
+/// collector knows whether to touch the hosts file at all) and
+/// `in_force_domains` are the domains whose schedule is active right now.
+pub fn website_block_state(conn: &Connection) -> DbResult<(bool, Vec<String>)> {
+    let mins = mins_since_midnight_now();
+    let rules = get_block_rules(conn)?;
+    let mut in_use = false;
+    let mut in_force = Vec::new();
+    for r in rules {
+        if matches!(r.kind, BlockKind::Website) && r.enabled {
+            in_use = true;
+            if rule_in_force_at(&r, mins) {
+                in_force.push(r.pattern);
+            }
+        }
+    }
+    Ok((in_use, in_force))
+}
+
 /* ---------------------------------- tests --------------------------------- */
 
 #[cfg(test)]
@@ -1408,6 +1656,97 @@ mod tests {
             start_ms: start,
             end_ms: end,
         }
+    }
+
+    #[test]
+    fn migrate_upgrades_old_database_without_data_loss() {
+        // Simulate a v0.1.0-era database: original tables only, block_rule
+        // WITHOUT the schedule columns, and no category_goal / focus_session
+        // tables. Then run the current migration over it (an in-place upgrade).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE category (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, color TEXT, productive INTEGER);
+            CREATE TABLE app (id INTEGER PRIMARY KEY, app_key TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, category_id INTEGER);
+            CREATE TABLE event (id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL, title TEXT, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL);
+            CREATE TABLE daily_app_usage (day TEXT NOT NULL, app_id INTEGER NOT NULL, total_ms INTEGER NOT NULL, PRIMARY KEY (day, app_id));
+            CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE exclusion (id INTEGER PRIMARY KEY, match_type TEXT NOT NULL, pattern TEXT NOT NULL);
+            CREATE TABLE app_limit (app_id INTEGER PRIMARY KEY, daily_ms INTEGER NOT NULL, strictness TEXT NOT NULL);
+            CREATE TABLE block_rule (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, pattern TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);
+            "#,
+        )
+        .unwrap();
+        // Seed representative old user data across the core tables.
+        conn.execute(
+            "INSERT INTO app (app_key, display_name) VALUES ('chrome.exe', 'chrome')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO event (app_id, title, start_ms, end_ms, duration_ms) VALUES (1, NULL, 1000, 5000, 4000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO daily_app_usage (day, app_id, total_ms) VALUES ('2026-01-01', 1, 4000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO block_rule (kind, pattern, enabled) VALUES ('app', 'game.exe', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO setting (key, value) VALUES ('idle_threshold_secs', '300')",
+            [],
+        )
+        .unwrap();
+
+        // The upgrade: run the current schema migration in place.
+        migrate(&conn).unwrap();
+
+        // 1) Old data is untouched.
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 1, "old events must survive the upgrade");
+        let usage: i64 = conn
+            .query_row(
+                "SELECT total_ms FROM daily_app_usage WHERE day = '2026-01-01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage, 4000, "old rollups must survive the upgrade");
+
+        // 2) New columns exist; the pre-existing block_rule row gets the
+        //    schedule defaults (disabled, no window).
+        let rules = get_block_rules(&conn).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].schedule_enabled);
+        assert_eq!(rules[0].schedule_start, None);
+
+        // 3) New tables exist and are usable.
+        save_focus_session(&conn, 10, 20, "after upgrade").unwrap();
+        assert_eq!(list_focus_sessions(&conn, 10).unwrap().len(), 1);
+        assert!(get_category_goals(&conn).unwrap().is_empty());
+
+        // 4) Old settings are preserved; new settings fall back to defaults.
+        let s = get_settings(&conn).unwrap();
+        assert_eq!(s.idle_threshold_secs, 300, "preserved old setting");
+        assert_eq!(s.palette, "signal", "new setting default");
+        assert_eq!(s.language, "en", "new setting default");
+        assert!(!s.bedtime_grayscale_enabled, "new setting default");
+
+        // 5) Running migrate() AGAIN (e.g. a later restart) is a no-op and
+        //    still preserves everything - idempotency.
+        migrate(&conn).unwrap();
+        let events_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events_again, 1);
     }
 
     #[test]
@@ -1560,6 +1899,101 @@ mod tests {
         assert_eq!(limits.len(), 1);
         assert_eq!(limits[0].used_ms, 10_000);
         assert!(limits[0].exceeded);
+    }
+
+    #[test]
+    fn zero_limit_is_never_exceeded() {
+        // A 0 ms limit is not a real cap; it must not report exceeded at 0
+        // usage (which would fire a "limit reached" nudge immediately).
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO app (app_key, display_name) VALUES ('idle.exe', 'idle')",
+            [],
+        )
+        .unwrap();
+        let app_id: i64 = conn
+            .query_row("SELECT id FROM app WHERE app_key = 'idle.exe'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        set_limit(
+            &conn,
+            &LimitInput {
+                app_id,
+                daily_ms: 0,
+                strictness: LimitStrictness::Medium,
+            },
+        )
+        .unwrap();
+        let limits = get_limits(&conn).unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].used_ms, 0);
+        assert!(!limits[0].exceeded);
+    }
+
+    #[test]
+    fn encrypted_snapshot_round_trips_and_rejects_wrong_key() {
+        let key = [9u8; 32];
+        let tmp = std::env::temp_dir().join(format!("st-enc-test-{}.enc", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let legacy = std::env::temp_dir().join("st-no-such-legacy.sqlite");
+
+        // Fresh in-memory DB, insert some usage, persist an encrypted snapshot.
+        {
+            let conn = open_encrypted(&tmp, &key, &legacy).unwrap();
+            let now = Local::now().timestamp_millis();
+            insert_events(&conn, &[ev("chrome", now, now + 5_000)]).unwrap();
+            snapshot_encrypted(&conn, &tmp, &key).unwrap();
+        }
+        // The on-disk snapshot must NOT be a readable SQLite file (it's encrypted).
+        let raw = std::fs::read(&tmp).unwrap();
+        assert!(&raw[..16.min(raw.len())] != b"SQLite format 3\0");
+
+        // Reopen from the encrypted snapshot: the data survives a round-trip.
+        {
+            let conn = open_encrypted(&tmp, &key, &legacy).unwrap();
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(total_ms), 0) FROM daily_app_usage",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(total, 5_000);
+        }
+        // A wrong key cannot open it.
+        assert!(open_encrypted(&tmp, &[1u8; 32], &legacy).is_err());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn app_goals_round_trip() {
+        let conn = mem();
+        let now = Local::now().timestamp_millis();
+        insert_events(&conn, &[ev("game", now, now + 600_000)]).unwrap();
+        let app_id: i64 = conn
+            .query_row("SELECT id FROM app WHERE app_key = 'game.exe'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        set_app_goal(
+            &conn,
+            &AppGoalInput {
+                app_id,
+                daily_ms: 1_800_000,
+                kind: GoalKind::Under,
+            },
+        )
+        .unwrap();
+        let goals = get_app_goals(&conn).unwrap();
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].app_id, app_id);
+        assert_eq!(goals[0].today_ms, 600_000);
+        // Under 30m today, so the goal is met and the streak counts today.
+        assert!(goals[0].streak_days >= 1);
+        remove_app_goal(&conn, app_id).unwrap();
+        assert!(get_app_goals(&conn).unwrap().is_empty());
     }
 
     #[test]

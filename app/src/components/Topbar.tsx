@@ -2,6 +2,7 @@ import { Pause, Play, Sun, Moon, Monitor } from "lucide-react";
 import type { CollectorState, ThemePreference } from "../lib/types";
 import { useTheme } from "../theme/ThemeProvider";
 import { cx } from "./ui";
+import { t } from "../lib/i18n";
 
 const STATE_LABEL: Record<CollectorState, string> = {
   active: "Active",
@@ -48,7 +49,7 @@ export function Topbar({
       <div className="flex items-center gap-3">
         <span className="flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1.5 text-label text-text-muted">
           <span className={cx("h-2 w-2 rounded-full", STATE_DOT[state])} aria-hidden />
-          {STATE_LABEL[state]}
+          {t(`state.${state}`, STATE_LABEL[state])}
           {state === "active" && activeApp ? (
             <span className="text-text">- {activeApp}</span>
           ) : null}
@@ -65,7 +66,7 @@ export function Topbar({
           ) : (
             <Pause className="h-4 w-4" aria-hidden />
           )}
-          {paused ? "Resume" : "Pause"}
+          {paused ? t("common.resume", "Resume") : t("common.pause", "Pause")}
         </button>
 
         <button

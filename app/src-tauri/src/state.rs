@@ -22,6 +22,14 @@ pub struct Shared {
     pub focus_active: bool,
     /// Phase 2: when the current focus session auto-ends (UTC unix-millis).
     pub focus_ends_ms: Option<i64>,
+    /// Whether the global pause/resume hotkey registered successfully. False
+    /// means another process already owns the chord; the UI surfaces this so
+    /// the shortcut isn't silently dead.
+    pub hotkey_registered: bool,
+    /// Whether the collector currently has bedtime grayscale applied. Read on
+    /// quit so we can undo a best-effort OS change (notably the Linux GTK theme
+    /// swap) instead of leaving the user's display altered after exit.
+    pub grayscale_applied: bool,
 }
 
 impl Shared {
@@ -38,6 +46,8 @@ impl Shared {
             capture_titles,
             focus_active: false,
             focus_ends_ms: None,
+            hotkey_registered: true,
+            grayscale_applied: false,
         }
     }
 }
@@ -46,6 +56,12 @@ impl Shared {
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub shared: Arc<Mutex<Shared>>,
-    /// On-disk path of the live SQLite database (for backup / restore).
+    /// On-disk path of the legacy plaintext SQLite database (kept for reference;
+    /// in production the live DB is in memory and persisted only as encrypted
+    /// snapshots - see `enc`).
     pub db_path: std::path::PathBuf,
+    /// `(encrypted snapshot path, 32-byte key)` when data-at-rest encryption is
+    /// active. The collector and the exit handler write encrypted snapshots
+    /// here. `None` in test mode (which uses a plaintext file DB).
+    pub enc: Option<(std::path::PathBuf, [u8; 32])>,
 }

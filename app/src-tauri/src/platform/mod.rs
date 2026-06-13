@@ -14,6 +14,10 @@ pub struct ActiveWindow {
     pub app_name: String,
     /// Window title; only populated when the user enabled title capture.
     pub title: Option<String>,
+    /// On-disk path of the executable / app bundle, when known. Stored so the
+    /// UI can extract a real OS icon for the app. `None` when not resolvable
+    /// (e.g. Linux, where there's no reliable per-window path).
+    pub app_path: Option<String>,
 }
 
 /// The only platform-specific surface. Implementations must be cheap to call once

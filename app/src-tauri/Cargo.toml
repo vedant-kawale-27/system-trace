@@ -36,7 +36,15 @@ serde_json = "1"
 
 # Local SQLite. rusqlite with the bundled SQLite (no system dependency), WAL is
 # enabled at runtime. Chosen over sqlx for a single-writer, synchronous core.
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup", "serialize"] }
+
+# Data-at-rest encryption. Pure-Rust AEAD (no OpenSSL / C build tools), with the
+# database key kept in the OS credential store via `keyring` (Windows Credential
+# Manager / macOS Keychain / Linux Secret Service). `rand` generates the key and
+# per-write nonces.
+chacha20poly1305 = "0.10"
+keyring = "3"
+rand = "0.8"
 
 # Async runtime for the collector background task and scheduled services.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -61,8 +69,13 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
+    "Win32_System_StationsAndDesktops",
     "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

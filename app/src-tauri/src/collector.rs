@@ -134,7 +134,7 @@ mod runtime {
     use crate::db;
     use crate::models::{event, CollectorState, LimitStrictness, UsageTick};
     use crate::platform;
-    use crate::state::Shared;
+    use crate::state::{AppState, Shared};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tauri::{AppHandle, Emitter, Manager};
@@ -144,6 +144,9 @@ mod runtime {
     const FLUSH_MS: i64 = 15_000;
     const EMIT_MS: i64 = 5_000;
     const MAX_BUFFER: usize = 64;
+    // How often to persist an encrypted snapshot of the in-memory database to
+    // disk. Bounds how much recent activity a hard crash could lose.
+    const SNAPSHOT_MS: i64 = 120_000;
 
     fn now_ms() -> i64 {
         chrono::Utc::now().timestamp_millis()
@@ -355,7 +358,7 @@ mod runtime {
             .spawn(move || {
                 let mut watcher = platform::make_watcher();
                 let (mut thr, mut cap) = {
-                    let s = shared.lock().unwrap();
+                    let s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     (s.idle_threshold_ms, s.capture_titles)
                 };
                 let mut builder = SessionBuilder::new(thr, cap);
@@ -377,9 +380,47 @@ mod runtime {
                 let mut distract_run_ms: i64 = 0;
                 let mut distract_last_app: Option<String> = None;
                 let mut distract_fired_app: Option<String> = None;
+                // Whether the current foreground app counts as distracting.
+                // Computed on app change and then refreshed at most every 10s
+                // (below) instead of querying the DB every 1s tick while the
+                // same app stays in front - so re-categorizing an app still
+                // takes effect promptly without the per-tick query cost.
+                let mut distract_is_distracting: bool = false;
+                let mut distract_last_check: i64 = 0;
                 // Grayscale state: track whether we last applied it so we only
                 // toggle on transitions, not every loop iteration.
                 let mut grayscale_active: bool = false;
+                // Apply grayscale on a single dedicated worker so toggles are
+                // serialized and the *last* request always wins. Spawning a
+                // fresh detached thread per transition (the old approach) let
+                // an "off" write land after a later "on" write and leave the
+                // display stuck. The worker coalesces queued requests and
+                // records what it actually applied into shared state.
+                let (gray_tx, gray_rx) = std::sync::mpsc::channel::<bool>();
+                {
+                    let shared_for_gray = shared.clone();
+                    std::thread::spawn(move || {
+                        while let Ok(mut want) = gray_rx.recv() {
+                            while let Ok(newer) = gray_rx.try_recv() {
+                                want = newer;
+                            }
+                            let _ = crate::grayscale::set_grayscale(want);
+                            if let Ok(mut s) = shared_for_gray.lock() {
+                                s.grayscale_applied = want;
+                            }
+                        }
+                    });
+                }
+                // Phase 4 website-block state: the set of domains we last wrote
+                // to the system hosts file, so we only rewrite it when the
+                // in-force set actually changes (None = feature unused / nothing
+                // written by us).
+                let mut applied_web_block: Option<Vec<String>> = None;
+                // Last app we stored an executable path for (icon extraction),
+                // so we only attempt the write once per app appearance.
+                let mut last_path_app: Option<String> = None;
+                // When we last persisted an encrypted snapshot to disk.
+                let mut last_snapshot = now_ms();
                 // Catch up on any summary missed while the app was closed.
                 check_summaries(&app, &db);
 
@@ -390,7 +431,7 @@ mod runtime {
 
                     // Pull live settings each loop so changes apply without restart.
                     let paused = {
-                        let s = shared.lock().unwrap();
+                        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
                         thr = s.idle_threshold_ms;
                         cap = s.capture_titles;
                         s.paused
@@ -415,6 +456,20 @@ mod runtime {
                         let media = watcher.is_media_playing();
                         cur_key = win.as_ref().map(|w| w.app_key.clone());
                         cur_name = win.as_ref().map(|w| w.app_name.clone());
+
+                        // Remember the app's executable/bundle path once so the
+                        // UI can extract a real icon. The UPDATE is a no-op until
+                        // the app row exists (created on the next flush), so a
+                        // brand-new app just picks it up the next time it's seen.
+                        let cur_path = win.as_ref().and_then(|w| w.app_path.clone());
+                        if let (Some(k), Some(p)) = (cur_key.as_deref(), cur_path.as_deref()) {
+                            if last_path_app.as_deref() != Some(k) {
+                                last_path_app = Some(k.to_string());
+                                if let Ok(conn) = db.lock() {
+                                    let _ = db::set_app_path(&conn, k, p);
+                                }
+                            }
+                        }
 
                         if let Some(ev) = builder.observe(now, win.clone(), idle, locked, media) {
                             buffer.push(ev);
@@ -448,7 +503,7 @@ mod runtime {
 
                     // Update shared live state for the commands.
                     {
-                        let mut s = shared.lock().unwrap();
+                        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                         s.state = new_state;
                         s.active_app = active_app.clone();
                     }
@@ -462,7 +517,14 @@ mod runtime {
                     // here should not break the rest of the loop.
                     let want_grayscale = in_bed && well.bedtime_grayscale_enabled;
                     if want_grayscale != grayscale_active {
-                        let _ = crate::grayscale::set_grayscale(want_grayscale);
+                        // Hand the request to the serialized worker (set above):
+                        // it runs the blocking OS call off this loop and records
+                        // what it applied into shared.grayscale_applied for the
+                        // exit handler. If the worker is gone, fall back to an
+                        // inline best-effort apply.
+                        if gray_tx.send(want_grayscale).is_err() {
+                            let _ = crate::grayscale::set_grayscale(want_grayscale);
+                        }
                         grayscale_active = want_grayscale;
                     }
                     if matches!(new_state, CollectorState::Active) {
@@ -499,13 +561,24 @@ mod runtime {
                         && matches!(new_state, CollectorState::Active)
                     {
                         let cur = cur_key.as_deref();
-                        if cur != distract_last_app.as_deref() {
+                        let app_changed = cur != distract_last_app.as_deref();
+                        if app_changed {
                             distract_run_ms = 0;
                             distract_last_app = cur.map(|s| s.to_string());
                             distract_fired_app = None;
                         }
+                        // Refresh the cached "is distracting" flag on app change,
+                        // and otherwise at most every 10s so a category edit
+                        // while the same app stays in front is picked up.
+                        if app_changed || now - distract_last_check >= 10_000 {
+                            distract_is_distracting = match cur {
+                                Some(key) => app_is_distracting(&db, key),
+                                None => false,
+                            };
+                            distract_last_check = now;
+                        }
                         if let Some(key) = cur {
-                            if app_is_distracting(&db, key) {
+                            if distract_is_distracting {
                                 distract_run_ms += delta;
                                 if distract_run_ms >= well.distraction_threshold_ms
                                     && distract_fired_app.as_deref() != Some(key)
@@ -572,14 +645,15 @@ mod runtime {
 
                         // Auto-end a focus session whose timer elapsed.
                         let (focus_active, focus_ends) = {
-                            let s = shared.lock().unwrap();
+                            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
                             (s.focus_active, s.focus_ends_ms)
                         };
                         if focus_active {
                             if let Some(end) = focus_ends {
                                 if now >= end {
                                     {
-                                        let mut s = shared.lock().unwrap();
+                                        let mut s =
+                                            shared.lock().unwrap_or_else(|e| e.into_inner());
                                         s.focus_active = false;
                                         s.focus_ends_ms = None;
                                     }
@@ -607,6 +681,7 @@ mod runtime {
                         // Quiet hours suppress limit nudges (focus blocks stay explicit).
                         if !in_bed {
                             for l in newly_exceeded {
+                                let strict = l.strictness == LimitStrictness::Strict;
                                 let _ = app
                                     .notification()
                                     .builder()
@@ -619,11 +694,26 @@ mod runtime {
                                     ))
                                     .show();
                                 let _ = app.emit(event::LIMIT_REACHED, l);
+                                // Strict limits get a blocking lockout overlay in
+                                // the UI; bring the window forward so it is seen
+                                // even when minimized to the tray.
+                                if strict {
+                                    if let Some(w) = app.get_webview_window("main") {
+                                        let _ = w.unminimize();
+                                        let _ = w.show();
+                                        let _ = w.set_focus();
+                                    }
+                                }
                             }
                         }
 
                         // Nudge if a blocked app is in the foreground during focus mode.
-                        let focus_on = { shared.lock().unwrap().focus_active };
+                        let focus_on = {
+                            shared
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .focus_active
+                        };
                         if focus_on {
                             if let Some(key) = &cur_key {
                                 let kl = key.to_lowercase();
@@ -636,6 +726,55 @@ mod runtime {
                                         event::FOCUS_BLOCKED,
                                         serde_json::json!({ "app": name }),
                                     );
+                                }
+                            }
+                        }
+
+                        // ---- Phase 4: keep the system hosts file in sync with
+                        // website block schedules. enabled_website_block_patterns
+                        // already respects each rule's window, so this auto-
+                        // applies at a window's start and clears at its end -
+                        // which the manual-only commands never did. We only
+                        // touch the hosts file when the set we'd write actually
+                        // changes, so this is cheap and avoids permission spam
+                        // for users who never enabled website blocking.
+                        let web_state = db
+                            .lock()
+                            .ok()
+                            .and_then(|c| db::website_block_state(&c).ok());
+                        if let Some((in_use, mut in_force)) = web_state {
+                            in_force.sort();
+                            let desired = if in_use { Some(in_force) } else { None };
+                            let need_action = match (&desired, &applied_web_block) {
+                                (Some(d), Some(a)) => d != a,
+                                (Some(_), None) => true,
+                                (None, Some(_)) => true,
+                                (None, None) => false,
+                            };
+                            if need_action {
+                                let res = match &desired {
+                                    Some(domains) => crate::blocker::apply(domains).map(|_| ()),
+                                    None => crate::blocker::clear(),
+                                };
+                                match res {
+                                    Ok(()) => applied_web_block = desired,
+                                    Err(e) => log::warn!("website block sync failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+
+                    // Periodically persist an encrypted snapshot of the
+                    // in-memory database so a crash loses at most SNAPSHOT_MS of
+                    // recent activity. No-op in test mode (enc is None).
+                    if now - last_snapshot >= SNAPSHOT_MS {
+                        last_snapshot = now;
+                        if let Some(st) = app.try_state::<AppState>() {
+                            if let Some((path, key)) = &st.enc {
+                                if let Ok(conn) = db.lock() {
+                                    if let Err(e) = db::snapshot_encrypted(&conn, path, key) {
+                                        log::warn!("encrypted snapshot failed: {e}");
+                                    }
                                 }
                             }
                         }
@@ -659,6 +798,7 @@ mod tests {
             app_key: format!("{app}.exe"),
             app_name: app.to_string(),
             title: title.map(|t| t.to_string()),
+            app_path: None,
         }
     }
 

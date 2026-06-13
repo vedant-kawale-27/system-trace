@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>System Trace - Per-site time</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      body {
+        width: 320px;
+        margin: 0;
+        padding: 12px 14px;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 2px;
+      }
+      .sub {
+        font-size: 11px;
+        opacity: 0.65;
+        margin: 0 0 10px;
+      }
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        max-height: 280px;
+        overflow-y: auto;
+      }
+      li {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 5px 0;
+        font-size: 12px;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.18);
+      }
+      .domain {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .dur {
+        opacity: 0.8;
+        font-variant-numeric: tabular-nums;
+      }
+      .empty {
+        font-size: 12px;
+        opacity: 0.6;
+        padding: 14px 0;
+        text-align: center;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      button {
+        flex: 1;
+        font-size: 12px;
+        padding: 6px 8px;
+        border: 1px solid rgba(128, 128, 128, 0.4);
+        border-radius: 6px;
+        background: transparent;
+        cursor: pointer;
+        color: inherit;
+      }
+      button:hover {
+        background: rgba(128, 128, 128, 0.12);
+      }
+      .danger {
+        color: #e5484d;
+        border-color: rgba(229, 72, 77, 0.5);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Per-site time today</h1>
+    <p class="sub">Stays in your browser. Export to merge into System Trace.</p>
+    <ul id="list"></ul>
+    <div id="empty" class="empty" hidden>No sites tracked yet today.</div>
+    <div class="row">
+      <button id="export">Export JSON</button>
+      <button id="clear" class="danger">Clear</button>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

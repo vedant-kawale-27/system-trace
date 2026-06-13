@@ -10,9 +10,12 @@ import { Settings } from "./pages/Settings";
 import { Onboarding } from "./pages/Onboarding";
 import { BreakOverlay } from "./components/BreakOverlay";
 import { DistractionToast } from "./components/DistractionToast";
+import { LimitLockout } from "./components/LimitLockout";
 import type { Page } from "./lib/nav";
 import type { CollectorState } from "./lib/types";
 import { getCollectorState, getSettings, onUsageTick, setTrackingPaused } from "./lib/api";
+import { initNotifications } from "./lib/notify";
+import { t } from "./lib/i18n";
 
 const TITLES: Record<Page, string> = {
   dashboard: "Dashboard",
@@ -41,6 +44,11 @@ export default function App() {
 
   useEffect(() => {
     getCollectorState().then(setState).catch(() => {});
+  }, []);
+
+  // Register the notification-click handler once so reminders open the app.
+  useEffect(() => {
+    initNotifications();
   }, []);
 
   useEffect(() => {
@@ -77,7 +85,7 @@ export default function App() {
       <Sidebar active={page} onNavigate={setPage} />
       <div className="flex min-w-0 flex-1 flex-col">
         <Topbar
-          title={TITLES[page]}
+          title={t(`nav.${page}`, TITLES[page])}
           state={state}
           activeApp={activeApp}
           paused={paused}
@@ -94,6 +102,7 @@ export default function App() {
       </div>
       <BreakOverlay />
       <DistractionToast />
+      <LimitLockout />
     </div>
   );
 }

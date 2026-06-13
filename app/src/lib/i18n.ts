@@ -34,6 +34,10 @@ const en: Catalog = {
   "settings.palette": "Accent palette",
   "common.pause": "Pause",
   "common.resume": "Resume",
+  "state.active": "Active",
+  "state.idle": "Idle",
+  "state.locked": "Locked",
+  "state.paused": "Paused",
 };
 
 const CATALOGS: Record<string, Catalog> = { en };

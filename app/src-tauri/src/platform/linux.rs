@@ -19,6 +19,9 @@ use x11rb::rust_connection::RustConnection;
 
 pub struct LinuxWatcher {
     conn: Option<(RustConnection, Window)>,
+    /// Whether the X SCREENSAVER extension answered our probe at startup. When
+    /// false we have no idle signal at all.
+    idle_supported: bool,
 }
 
 impl Default for LinuxWatcher {
@@ -33,7 +36,21 @@ impl LinuxWatcher {
             let root = c.setup().roots[screen].root;
             (c, root)
         });
-        LinuxWatcher { conn }
+        // Probe the SCREENSAVER extension once so idle_ms can tell "no idle
+        // signal available" apart from "user just had input".
+        let idle_supported = conn
+            .as_ref()
+            .map(|(c, root)| {
+                c.screensaver_query_info(*root)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+                    .is_some()
+            })
+            .unwrap_or(false);
+        LinuxWatcher {
+            conn,
+            idle_supported,
+        }
     }
 
     fn atom(&self, name: &[u8]) -> Option<u32> {
@@ -90,6 +107,8 @@ impl LinuxWatcher {
             app_name: app_key.clone(),
             app_key,
             title,
+            // No reliable per-window executable path on X11/Wayland.
+            app_path: None,
         })
     }
 }
@@ -100,13 +119,58 @@ impl Watcher for LinuxWatcher {
     }
 
     fn idle_ms(&mut self) -> u64 {
+        // When we have no idle signal - no X connection (e.g. Wayland) or an X
+        // server without the SCREENSAVER extension - report "fully idle"
+        // (u64::MAX) rather than 0. Returning 0 means "the user just had input",
+        // which would count the foreground app as active around the clock even
+        // while the user is away. Reporting idle instead makes the collector
+        // stop accumulating, which is the safe direction. (Under Wayland
+        // active_window() also returns None, so no session is open anyway.)
         let Some((c, root)) = self.conn.as_ref() else {
-            return 0;
+            return u64::MAX;
         };
+        if !self.idle_supported {
+            return u64::MAX;
+        }
         c.screensaver_query_info(*root)
             .ok()
             .and_then(|cookie| cookie.reply().ok())
             .map(|r| r.ms_since_user_input as u64)
-            .unwrap_or(0)
+            .unwrap_or(u64::MAX)
+    }
+
+    fn is_media_playing(&mut self) -> bool {
+        // Best-effort and dependency-free: ALSA exposes a per-substream status
+        // file under /proc/asound. A playback substream reads "RUNNING" while
+        // audio is actually flowing, so we scan the playback ("pcm*p") streams.
+        // This catches PipeWire/Pulse output too, since they sit on top of ALSA.
+        use std::fs;
+        let Ok(cards) = fs::read_dir("/proc/asound") else {
+            return false;
+        };
+        for card in cards.flatten() {
+            let Ok(pcms) = fs::read_dir(card.path()) else {
+                continue;
+            };
+            for pcm in pcms.flatten() {
+                let name = pcm.file_name();
+                let name = name.to_string_lossy();
+                // Playback devices are named like "pcm0p".
+                if !(name.starts_with("pcm") && name.ends_with('p')) {
+                    continue;
+                }
+                let Ok(subs) = fs::read_dir(pcm.path()) else {
+                    continue;
+                };
+                for sub in subs.flatten() {
+                    if let Ok(s) = fs::read_to_string(sub.path().join("status")) {
+                        if s.contains("RUNNING") {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }

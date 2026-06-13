@@ -62,6 +62,26 @@ pub fn set_grayscale(on: bool) -> Result<bool, String> {
         "/f",
     ]);
     c.output().map_err(|e| e.to_string())?;
+
+    // The registry write alone does not nudge the running session to re-read
+    // the color-filter state. Broadcast WM_SETTINGCHANGE so the shell and any
+    // listeners refresh - this is the same notification the Settings toggle
+    // raises. Best-effort: a failed broadcast must not fail the whole call.
+    unsafe {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        };
+        let _ = SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            100,
+            None,
+        );
+    }
     Ok(true)
 }
 

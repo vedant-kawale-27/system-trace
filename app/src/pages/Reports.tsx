@@ -1,6 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { CalendarDays, Clock, TrendingUp, Flame, Repeat, AppWindow, Timer } from "lucide-react";
+import {
+  CalendarDays,
+  Clock,
+  TrendingUp,
+  Flame,
+  Repeat,
+  AppWindow,
+  Timer,
+  FileDown,
+} from "lucide-react";
 import { getDayOverview, getRangeOverview } from "../lib/api";
+import { downloadReportPdf } from "../lib/pdf";
 import { useAsync } from "../lib/useAsync";
 import {
   addDays,
@@ -208,6 +218,8 @@ export function Reports() {
   const today = dayKeyOffset(0);
   const [mode, setMode] = useState<Mode>("week");
   const [anchor, setAnchor] = useState<string>(today);
+  const [pdfMsg, setPdfMsg] = useState<string | null>(null);
+  const [pdfBusy, setPdfBusy] = useState(false);
 
   // Snap the anchor back into the current period whenever the mode changes,
   // so switching modes never lands on a confusing partial window.
@@ -282,8 +294,32 @@ export function Reports() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, anchor, atPresent]);
 
+  async function downloadPdf() {
+    if (pdfBusy) return;
+    setPdfBusy(true);
+    setPdfMsg("Building PDF...");
+    try {
+      const msg = await downloadReportPdf({ mode, from: rangeFrom, to: rangeTo, label });
+      setPdfMsg(msg || null);
+    } catch (e) {
+      setPdfMsg(`Could not export: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setPdfBusy(false);
+      window.setTimeout(() => setPdfMsg(null), 4000);
+    }
+  }
+
   return (
     <div className="space-y-5">
+      {pdfMsg ? (
+        <div
+          className="fixed bottom-6 left-1/2 z-40 -translate-x-1/2 rounded-md border border-accent/40 bg-surface px-4 py-2 text-body text-text shadow-e2 dark:shadow-e2-dark"
+          role="status"
+          aria-live="polite"
+        >
+          {pdfMsg}
+        </div>
+      ) : null}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
           <CardTitle>Overview</CardTitle>
@@ -297,14 +333,24 @@ export function Reports() {
             ]}
           />
         </div>
-        <DateStepper
-          label={label}
-          onPrev={() => step(-1)}
-          onNext={() => step(1)}
-          onReset={() => setAnchor(today)}
-          atPresent={atPresent}
-          resetLabel={resetLabel}
-        />
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={downloadPdf}
+            disabled={pdfBusy}
+            className="flex items-center gap-1.5 rounded-md border border-border bg-surface px-3 py-1.5 text-body-strong text-text hover:bg-surface-2 disabled:opacity-60"
+          >
+            <FileDown className="h-4 w-4" aria-hidden /> {pdfBusy ? "Exporting..." : "PDF"}
+          </button>
+          <DateStepper
+            label={label}
+            onPrev={() => step(-1)}
+            onNext={() => step(1)}
+            onReset={() => setAnchor(today)}
+            atPresent={atPresent}
+            resetLabel={resetLabel}
+          />
+        </div>
       </div>
 
       {mode === "day" ? (

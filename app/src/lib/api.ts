@@ -14,10 +14,14 @@ import {
   type BlockRuleInput,
   type BreakDue,
   type DistractionNudge,
+  type LimitReached,
   type BackupResult,
   type Category,
   type CategoryGoal,
   type CategoryGoalInput,
+  type AppGoal,
+  type AppGoalInput,
+  type AppIcon,
   type CategoryInput,
   type FocusSession,
   type GoalStreak,
@@ -125,6 +129,27 @@ export function removeCategoryGoal(category_id: number): Promise<void> {
   return invoke(COMMAND.REMOVE_CATEGORY_GOAL, { category_id });
 }
 
+export function getAppGoals(): Promise<AppGoal[]> {
+  if (!isTauri) return Promise.resolve([]);
+  return invoke(COMMAND.GET_APP_GOALS);
+}
+
+export function setAppGoal(goal: AppGoalInput): Promise<void> {
+  if (!isTauri) return Promise.resolve();
+  return invoke(COMMAND.SET_APP_GOAL, { goal });
+}
+
+export function removeAppGoal(app_id: number): Promise<void> {
+  if (!isTauri) return Promise.resolve();
+  return invoke(COMMAND.REMOVE_APP_GOAL, { app_id });
+}
+
+/** The app's real OS icon (raw RGBA), or null to fall back to a letter avatar. */
+export function getAppIcon(app_key: string): Promise<AppIcon | null> {
+  if (!isTauri) return Promise.resolve(null);
+  return invoke(COMMAND.GET_APP_ICON, { app_key });
+}
+
 export function getFocusScore(): Promise<FocusScore> {
   if (!isTauri)
     return Promise.resolve({
@@ -230,6 +255,24 @@ export function getCollectorState(): Promise<CollectorState> {
   return invoke(COMMAND.GET_COLLECTOR_STATE);
 }
 
+/** Whether the global pause/resume hotkey registered (false = chord taken). */
+export function getHotkeyStatus(): Promise<boolean> {
+  if (!isTauri) return Promise.resolve(true);
+  return invoke(COMMAND.GET_HOTKEY_STATUS);
+}
+
+/** Bring the main window to the foreground (used on notification click). */
+export function focusMainWindow(): Promise<void> {
+  if (!isTauri) return Promise.resolve();
+  return invoke(COMMAND.FOCUS_MAIN_WINDOW);
+}
+
+/** Write a generated PDF (raw bytes) to a user-chosen path. Returns bytes written. */
+export function saveReportPdf(path: string, bytes: number[]): Promise<number> {
+  if (!isTauri) return Promise.resolve(0);
+  return invoke(COMMAND.SAVE_REPORT_PDF, { path, bytes });
+}
+
 export function setTrackingPaused(paused: boolean): Promise<CollectorState> {
   if (!isTauri) return Promise.resolve(paused ? "paused" : "active");
   return invoke(COMMAND.SET_TRACKING_PAUSED, { paused });
@@ -331,4 +374,12 @@ export async function onDistractionNudge(
 ): Promise<UnlistenFn> {
   if (!isTauri) return () => {};
   return listen<DistractionNudge>(EVENT.DISTRACTION_NUDGE, (e) => cb(e.payload));
+}
+
+/** Subscribe to `limit_reached`. Returns an unlisten function. */
+export async function onLimitReached(
+  cb: (l: LimitReached) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri) return () => {};
+  return listen<LimitReached>(EVENT.LIMIT_REACHED, (e) => cb(e.payload));
 }

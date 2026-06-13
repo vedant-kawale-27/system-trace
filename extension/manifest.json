@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "System Trace - Per-site time",
+  "version": "0.1.0",
+  "description": "Privacy-first per-website time tracking that complements the System Trace desktop app. All data stays in your browser; export it to merge into System Trace.",
+  "permissions": ["tabs", "storage", "idle", "alarms"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "System Trace - Per-site time"
+  },
+  "icons": {}
+}

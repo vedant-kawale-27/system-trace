@@ -4,6 +4,7 @@ import { getSettings, setSetting } from "../lib/api";
 import type { Settings, SettingKey } from "../lib/types";
 import { Card, CardTitle, Spinner, Toggle } from "../components/ui";
 import { Goals } from "../components/Goals";
+import { AppGoals } from "../components/AppGoals";
 
 function hhmmToMins(s: string): number {
   const [h, m] = s.split(":");
@@ -251,6 +252,7 @@ export function Wellbeing() {
       </div>
 
       <Goals />
+      <AppGoals />
     </div>
   );
 }

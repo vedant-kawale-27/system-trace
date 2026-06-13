@@ -65,3 +65,26 @@ jobs:
           releaseBody: "Download the installer for your OS below. All data stays local on your machine."
           releaseDraft: true
           prerelease: false
+
+  # Package the companion browser extension and attach it to the same draft
+  # release, so users can grab the load-unpacked zip alongside the installers.
+  extension:
+    name: Package browser extension
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate and zip the extension
+        run: |
+          node -e "const m=require('./extension/manifest.json'); if (m.manifest_version!==3) throw new Error('bad manifest'); console.log('ok', m.version)"
+          cd extension
+          zip -r ../system-trace-extension-${{ github.ref_name }}.zip . -x '*.DS_Store'
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: system-trace-extension-${{ github.ref_name }}.zip

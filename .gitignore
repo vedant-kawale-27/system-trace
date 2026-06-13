@@ -39,7 +39,19 @@ test-results/
 # Local databases (the tool's own local data should never be committed)
 *.sqlite
 *.sqlite3
+*.sqlite-wal
+*.sqlite-shm
 *.db
+
+# Encryption artifacts: never commit the DB key or the encrypted local snapshot.
+# These live in the OS app-data dir at runtime, not the repo, but guard anyway.
+*.enc
+*.enc.tmp
+db.key
+
+# Browser-extension packaging output (the source under extension/ IS committed).
+web-ext-artifacts/
+extension/*.zip
 
 # OS files
 .DS_Store

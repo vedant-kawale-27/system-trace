@@ -204,6 +204,31 @@ export interface CategoryGoalInput {
   kind: GoalKind;
 }
 
+/** A daily target for one app, with today's usage and its streak for display. */
+export interface AppGoal {
+  app_id: Id;
+  app_key: string;
+  display_name: string;
+  daily_ms: Millis;
+  kind: GoalKind;
+  today_ms: Millis;
+  streak_days: number;
+}
+
+/** Input for `set_app_goal`. */
+export interface AppGoalInput {
+  app_id: Id;
+  daily_ms: Millis;
+  kind: GoalKind;
+}
+
+/** Raw icon pixels for an app (RGBA, row-major, top-down). */
+export interface AppIcon {
+  width: number;
+  height: number;
+  rgba: number[];
+}
+
 /** A productivity Focus Score for a single day. 0..=100. Only surfaced when settings.scoring_enabled. */
 export interface FocusScore {
   day: DayKey;
@@ -506,6 +531,10 @@ export const COMMAND = {
   SET_CATEGORY_GOAL: "set_category_goal",
   REMOVE_CATEGORY_GOAL: "remove_category_goal",
   GET_GOAL_STREAKS: "get_goal_streaks",
+  GET_APP_GOALS: "get_app_goals",
+  SET_APP_GOAL: "set_app_goal",
+  REMOVE_APP_GOAL: "remove_app_goal",
+  GET_APP_ICON: "get_app_icon",
   SEARCH_USAGE: "search_usage",
   SAVE_FOCUS_SESSION: "save_focus_session",
   LIST_FOCUS_SESSIONS: "list_focus_sessions",
@@ -530,6 +559,9 @@ export const COMMAND = {
   WIPE_ALL_DATA: "wipe_all_data",
   // Collector control (drives `tracking_paused` + the live indicator)
   GET_COLLECTOR_STATE: "get_collector_state",
+  GET_HOTKEY_STATUS: "get_hotkey_status",
+  FOCUS_MAIN_WINDOW: "focus_main_window",
+  SAVE_REPORT_PDF: "save_report_pdf",
   SET_TRACKING_PAUSED: "set_tracking_paused",
   // Phase 2: limits
   GET_LIMITS: "get_limits",
@@ -595,6 +627,18 @@ export interface CommandMap {
   [COMMAND.GET_GOAL_STREAKS]: {
     args: Record<string, never>;
     result: GoalStreak[];
+  };
+  [COMMAND.GET_APP_GOALS]: {
+    args: Record<string, never>;
+    result: AppGoal[];
+  };
+  [COMMAND.SET_APP_GOAL]: {
+    args: { goal: AppGoalInput };
+    result: void;
+  };
+  [COMMAND.REMOVE_APP_GOAL]: {
+    args: { app_id: Id };
+    result: void;
   };
   [COMMAND.SEARCH_USAGE]: {
     args: { query: string; from: DayKey | null; to: DayKey | null };

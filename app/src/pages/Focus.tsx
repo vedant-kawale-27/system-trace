@@ -521,21 +521,24 @@ export function Focus() {
               onClick={applyBlock}
               className="flex items-center gap-1.5 rounded-md border border-border bg-surface px-3 py-1.5 text-body-strong text-text hover:bg-surface-2"
             >
-              <Globe className="h-4 w-4" aria-hidden /> Apply website block
+              <Globe className="h-4 w-4" aria-hidden /> Apply now
             </button>
             <button
               type="button"
               onClick={clearBlock}
               className="rounded-md border border-border bg-surface px-3 py-1.5 text-body-strong text-text hover:bg-surface-2"
             >
-              Clear
+              Clear now
             </button>
             {blockMsg && <span className="text-label text-text-muted">{blockMsg}</span>}
           </div>
           <p className="mt-3 text-label text-text-muted">
             App rules nudge you when a blocked app is in front during focus mode. System-wide
-            website blocking edits the hosts file and requires running System Trace as
-            administrator.
+            website blocking edits the hosts file (requires running System Trace as
+            administrator) and now follows each rule&apos;s schedule automatically - blocks
+            apply when a window opens and clear when it ends. The buttons above just force an
+            immediate sync; a &quot;Clear now&quot; will re-apply within seconds if a rule is
+            still enabled and in its active window.
           </p>
         </Card>
       </div>

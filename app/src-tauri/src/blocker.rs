@@ -26,19 +26,37 @@ fn hosts_path() -> PathBuf {
 }
 
 /// Return the hosts content with any existing managed block removed.
+///
+/// Defensive against a block that was left unterminated (a `BEGIN` with no
+/// `END`, e.g. if a previous write was interrupted): inside a managed block we
+/// only drop lines that are actually ours (our `127.0.0.1` entries or blanks).
+/// The moment we encounter a line that is *not* ours, we stop skipping and keep
+/// it - so an unterminated block can never silently delete the user's own hosts
+/// entries that follow it.
 fn strip_managed(content: &str) -> String {
     let mut out = String::new();
     let mut skipping = false;
     for line in content.lines() {
-        match line.trim() {
-            BEGIN => skipping = true,
-            END => skipping = false,
-            _ if !skipping => {
-                out.push_str(line);
-                out.push('\n');
-            }
-            _ => {}
+        let t = line.trim();
+        if t == BEGIN {
+            skipping = true;
+            continue;
         }
+        if t == END {
+            skipping = false;
+            continue;
+        }
+        if skipping {
+            let is_ours = t.is_empty() || t.starts_with("127.0.0.1 ");
+            if is_ours {
+                continue;
+            }
+            // Not one of our lines: the block was never terminated. Stop
+            // skipping and preserve this (user) line.
+            skipping = false;
+        }
+        out.push_str(line);
+        out.push('\n');
     }
     out
 }
@@ -93,6 +111,21 @@ mod tests {
         let s = strip_managed(&c);
         assert!(s.contains("127.0.0.1 localhost"));
         assert!(s.contains("10.0.0.1 keep"));
+        assert!(!s.contains("x.com"));
+        assert!(!s.contains("System Trace block"));
+    }
+
+    #[test]
+    fn strip_keeps_user_lines_after_an_unterminated_block() {
+        // A previous run wrote BEGIN + an entry but crashed before END. The
+        // user's real entries follow. They must survive the next strip.
+        let c = format!(
+            "127.0.0.1 localhost\n{BEGIN}\n127.0.0.1 x.com\n10.0.0.1 keep-me\n203.0.113.5 also-keep\n"
+        );
+        let s = strip_managed(&c);
+        assert!(s.contains("127.0.0.1 localhost"));
+        assert!(s.contains("10.0.0.1 keep-me"));
+        assert!(s.contains("203.0.113.5 also-keep"));
         assert!(!s.contains("x.com"));
         assert!(!s.contains("System Trace block"));
     }

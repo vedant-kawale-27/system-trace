@@ -76,9 +76,11 @@ The marketing website lives in a separate repository
 ## Features
 
 - **Automatic tracking:** records the active app and window with smart idle detection that
-  still counts videos and meetings (no "watching a video reads as idle" problem).
-- **Local-first storage:** a local SQLite database with daily and weekly rollups. No cloud,
-  no account, no telemetry.
+  still counts videos and meetings - audio actually playing keeps you "active", and a
+  locked screen counts as inactive (Windows/macOS), with real app icons in the lists.
+- **Encrypted, local-first storage:** the live database runs in memory and is persisted only
+  as **encrypted** snapshots (XChaCha20-Poly1305; key in the OS keyring), so no plaintext
+  database sits on disk. No cloud, no account, no telemetry.
 - **Clear dashboard:** a "Screen Time Today" hero, top apps, category split, and an
   hour-by-hour timeline.
 - **History explorer:** walk back through any past **day**, **week**, or **month**.
@@ -87,7 +89,11 @@ The marketing website lives in a separate repository
   Left and right arrow keys step through history.
 - **Search history:** find when you used an app across all tracked time, grouped by day.
 - **Neutral categories:** group apps your way, with an optional Focus Score.
-- **Per-app daily limits:** set a cap and choose how strict the nudge is when you reach it.
+- **Per-app daily limits:** set a cap and choose how strict the nudge is - a **strict**
+  limit shows a blocking lockout overlay when reached, not just a nudge.
+- **Goals:** daily "stay under / reach at least" targets on **categories and individual
+  apps**, each with a consecutive-day streak.
+- **PDF reports:** export a one-page summary of the current day, week, or month.
 - **Focus mode:** focus sessions with a live countdown and a note for what you worked on;
   block distracting apps and websites, with optional active-hours schedules.
 - **Global pause hotkey:** toggle tracking from anywhere with **Ctrl + Alt + P**.
@@ -100,6 +106,10 @@ The marketing website lives in a separate repository
   default.
 - **Make it yours:** dark and light themes plus Signal / Slate / Solar / Cocoa accent
   palettes. lucide-react icons, no emoji.
+- **Companion browser extension (optional):** a load-unpacked Manifest-V3 add-on in
+  [`extension/`](extension/) that tracks **per-site** time in the browser (domain only,
+  stored locally) and exports JSON you can fold into System Trace - see
+  [`extension/README.md`](extension/README.md).
 
 ## Installation
 
@@ -214,7 +224,8 @@ System-Trace/
 | App shell | Tauri 2 |
 | Core / tracking | Rust |
 | UI | React + TypeScript |
-| Storage | SQLite (rusqlite, bundled) |
+| Storage | SQLite (rusqlite, bundled); in-memory + encrypted snapshots at rest |
+| Encryption | XChaCha20-Poly1305 (chacha20poly1305), key in OS keyring |
 | Charts | uPlot |
 | Styling | Tailwind CSS |
 | Package manager | pnpm |
@@ -271,11 +282,21 @@ Contributions are welcome - bug fixes, the macOS and Linux watchers, new feature
 - [x] Phase 2 - Control (per-app limits, focus mode, app/website block rules)
 - [x] Phase 3 - Wellbeing (break reminders, quiet hours, summary notifications)
 - [x] Phase 4 - CI workflows, packaging config, macOS and Linux watchers
-- [ ] macOS window-title capture (Accessibility permission)
-- [ ] Linux Wayland active-window support (X11 is done)
-- [ ] System-wide website blocking enforcement (needs an elevated helper)
-- [ ] Code signing and notarization, and an auto-updater
-- [ ] Optional browser extension for per-website detail
+- [x] Data-at-rest encryption (in-memory DB + encrypted snapshots, key in the
+      OS keyring)
+- [x] Media-aware idle and lock detection (all OS)
+- [x] Real app icons (Windows/macOS; Linux falls back to a letter avatar)
+- [x] Per-app goals, strict-limit lockout, and PDF report export
+- [x] macOS window-title capture (with Accessibility permission)
+- [x] Companion browser extension for per-site detail (`extension/`,
+      load-unpacked)
+- [ ] Linux Wayland active-window support (X11 / XWayland is done; pure-Wayland
+      windows degrade safely and idle time is not counted as active)
+- [ ] System-wide website blocking without elevation (a privileged helper);
+      blocking already follows each rule's schedule automatically, but editing
+      the hosts file still requires running as administrator / root
+- [ ] Code signing and notarization, and an auto-updater (require paid
+      certificates / accounts)
 
 See [`docs/FEATURES.md`](docs/FEATURES.md) for the full plan.
 

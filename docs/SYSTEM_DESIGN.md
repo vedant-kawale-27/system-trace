@@ -124,8 +124,18 @@ Crates to use: `windows` (Win32), `core-graphics`/`cocoa`/`objc` (macOS),
 
 ## 6. Data Model (SQLite)
 
-WAL mode on. Identifiers are integers; timestamps are UTC unix-millis. Times shown
-in the UI are converted to local time there.
+Identifiers are integers; timestamps are UTC unix-millis. Times shown in the UI
+are converted to local time there.
+
+**Encryption at rest (since 0.4.0):** the live database runs **in memory**
+(`sqlite3_deserialize` from disk on launch). Only **encrypted** snapshots
+(XChaCha20-Poly1305 over `sqlite3_serialize` output) are written to disk -
+periodically (~2 min), on a data wipe, and on exit - so no plaintext database
+file exists at rest. The 32-byte key is stored in the OS credential store
+(Windows Credential Manager / macOS Keychain / Linux Secret Service) via the
+`keyring` crate, with a permission-restricted key-file fallback. A pre-0.4.0
+plaintext database is migrated on first launch and the old file removed. (Test
+mode uses a plaintext file DB to keep the E2E harness free of the keyring.)
 
 ```sql
 -- Apps seen on this machine (deduplicated)

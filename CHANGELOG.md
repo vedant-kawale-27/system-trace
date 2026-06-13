@@ -9,17 +9,173 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 Nothing yet. New work in progress lives here until the next tagged release.
 
-## [0.4.0] - 2026-06-14 - Always-visible status messages
+## [0.4.0] - 2026-06-14 - Gap-closure features
 
-A small follow-up release.
+A broad feature release closing the largest remaining gaps: real activity
+signals (media/lock detection), encryption at rest, real app icons, per-app
+goals, strict-limit enforcement, PDF export, a notification-click fix, and a
+companion browser extension.
+
+### Added
+
+**Data-at-rest encryption**
+- The live database now runs **in memory**; only **encrypted** snapshots
+  (XChaCha20-Poly1305) are written to disk - periodically and on exit - so no
+  plaintext database exists at rest. The key lives in the OS credential store
+  (Windows Credential Manager / macOS Keychain / Linux Secret Service) with a
+  restricted key-file fallback. Pure-Rust crypto, so it builds everywhere with
+  no extra toolchain. Existing plaintext databases are migrated on first launch
+  and the old plaintext file is removed. "Delete all data" rewrites the
+  encrypted snapshot immediately.
+
+**Media-aware idle + lock detection (all OS)**
+- Audio actually playing now keeps you "active" even with no input: Windows via
+  the WASAPI peak meter, macOS via CoreAudio, Linux via ALSA `/proc/asound`.
+- A locked/secure session now counts as inactive: Windows via the input desktop,
+  macOS via the window-server session dictionary.
+
+**Real app icons**
+- Top Apps / Apps / search now show the app's **real OS icon** (Windows exe
+  icon via GDI; macOS bundle icon), falling back to the letter avatar when none
+  is available. App executable paths are remembered for extraction.
+
+**Per-app goals**
+- Daily "stay under / reach at least" targets on individual apps (alongside
+  category goals), with progress bars and consecutive-day streaks.
+
+**Strict-limit lockout**
+- A **strict** daily limit now shows a blocking full-screen lockout overlay and
+  brings the window forward, rather than only nudging. (No process is killed -
+  consistent with the app's philosophy.) Medium/soft limits are unchanged.
+
+**PDF report export**
+- The Reports view can export a one-page PDF summary of the current day or
+  week/month (totals, top apps, categories). Local only, no email. jsPDF is
+  lazy-loaded so it isn't in the startup bundle.
+
+**Browser extension (companion, separate artifact)**
+- A Manifest-V3 extension under `extension/` tracks **per-site** time in the
+  browser (domain only, stored locally) and exports JSON matching System
+  Trace's per-app-per-day shape. Load-unpacked, no store or fee required.
+
+**macOS window titles**
+- Frontmost window title capture via the Accessibility API (when the user
+  grants Accessibility permission).
 
 ### Fixed
-- Settings status messages (export, backup and restore, and the update
-  check) used to render at the top of the Settings page, so any message
-  triggered while scrolled down appeared off-screen and looked like nothing
-  had happened. They now show as a fixed bottom-center toast that is always
-  visible, and linger a little longer so they are easy to read. This also
-  confirms the "Check for updates" result is shown reliably.
+- **Clicking a notification now opens the app.** A global notification-action
+  handler focuses the window when any reminder (break / limit / distraction) is
+  clicked, on every platform.
+
+### Notes
+- Linux per-site media detection and the new Linux/macOS native code paths are
+  verified by the CI build matrix. Linux **Wayland** active-window capture
+  remains compositor-specific and is not yet implemented (XWayland apps are
+  still tracked via the X11 path); pure-Wayland windows degrade gracefully.
+- Internationalization: the app chrome (navigation, top bar, sidebar, settings
+  sections, live-state labels) is migrated to the `t()` catalog; full
+  body-string coverage is ongoing mechanical work and renders English via
+  fallback meanwhile.
+
+## [0.3.1] - 2026-06-14 - Bug fixes
+
+A patch release that fixes a data-loss risk, makes backup/restore safe and
+instant, and resolves a batch of cross-platform correctness bugs found in a
+deep code and security review.
+
+### Fixed
+- **Resume did not visibly work.** `set_tracking_paused(false)` returned the
+  stale `Paused` collector state instead of a running one, so clicking
+  "Resume" in the top bar snapped straight back to "Resume" and looked
+  broken (the collector did resume in the background, but the UI never
+  reflected it until the next tick). Resuming now reports `Idle` immediately
+  so the button flips to "Pause" at once.
+- **Restore could lose data and required a restart.** Restore overwrote the
+  live database file under an open connection, which risked corruption and
+  meant the app had to be relaunched to see the data. Backup and restore now
+  use SQLite's online backup/restore API: backup takes a consistent snapshot
+  while holding the connection lock (no race with the collector mid-copy), and
+  restore copies the backup page-by-page into the live database - safe, and
+  effective immediately with no restart.
+- **Restored backups from older versions are migrated.** After a restore the
+  schema is brought up to date, so a backup taken on an earlier release gains
+  any newer columns, tables, and settings instead of leaving the app on a
+  stale schema.
+- **Global hotkey now persists and reports failure.** Toggling tracking with
+  Ctrl + Alt + P now saves the paused state (so it survives a restart, like
+  the Settings toggle does), and if another app already owns the shortcut,
+  Settings shows the chord as unavailable instead of letting it look dead.
+- **Bedtime grayscale no longer stalls tracking or lingers after quit.**
+  Applying the OS color filter (which shells out to `reg.exe` / `defaults` /
+  `gsettings`) now runs off the collector loop so a tick is never blocked on a
+  child process. On Windows it broadcasts `WM_SETTINGCHANGE` so the running
+  session picks up the change, and on quit any applied filter is undone so the
+  Linux theme swap does not outlive the app.
+- **Distraction nudges stop re-querying the database every tick.** Whether the
+  foreground app is distracting is now resolved once per app change and cached,
+  instead of hitting the database on every loop while the same app stays in
+  front.
+- **"Check for updates" now gives feedback and can't hang.** The button shows
+  a spinning, disabled "Checking..." state while it works, so feedback no
+  longer depends on a toast that could scroll off-screen or clear itself
+  mid-request - the original reason it looked like nothing happened. The whole
+  request (headers and body) is bounded by a 10-second timeout, and rate-limit
+  and connection failures are reported in plain language.
+- **Tracking can no longer be silently killed by a poisoned lock.** If any
+  thread panicked while holding the shared collector state, the next tick used
+  to panic the collector too and stop tracking for good; it now recovers and
+  keeps running.
+
+### Fixed (cross-platform correctness)
+
+A deeper review surfaced a batch of pre-existing bugs that affected specific
+operating systems or edge cases:
+
+- **Website blocking now honors its schedule (all OS).** Scheduled hosts-file
+  blocks were only ever written or removed by the manual Apply / Clear
+  buttons, so an overnight or timed window never switched on at its start or
+  off at its end. The collector now reconciles the system hosts file with the
+  in-force website rules continuously - blocks apply when a window opens and
+  clear when it ends. It only writes when the set changes, so it never spams
+  the hosts file or permission prompts for users who don't use website
+  blocking. The Apply / Clear buttons are now "force an immediate sync".
+- **The hosts blocker can no longer eat your hosts file (all OS).** If a
+  previous block was left unterminated (interrupted mid-write), the cleanup
+  pass used to delete every line after it - potentially your own hosts
+  entries. It now stops at the first line that isn't ours and preserves the
+  rest. Covered by a new test.
+- **Linux idle detection no longer counts you active forever.** Under Wayland
+  or an X server without the SCREENSAVER extension there is no idle signal;
+  the watcher used to report "0 ms since input" (always active), inflating
+  usage around the clock. It now reports idle in that case so time is not
+  counted while you're away.
+- **Windows: unreadable-process windows are no longer merged into one bogus
+  app.** A foreground window whose process couldn't be resolved (a protected
+  or elevated system surrogate) used to be attributed to a single synthetic
+  "Unknown" app, lumping unrelated windows together; such samples are now
+  skipped instead.
+- **Day drill-downs survive a daylight-saving spring-forward.** In time zones
+  where the clocks jump at midnight, local midnight doesn't exist, and the
+  per-day view used to fall back to 1970 and mix in unrelated events. It now
+  resolves the first real instant of the day.
+- **A zero / brand-new limit no longer fires immediately.** A daily limit of
+  0 ms counted as "exceeded" at 0 usage and fired a "limit reached" nudge at
+  once; a non-positive limit is now never treated as exceeded. Covered by a
+  new test.
+- **Bedtime grayscale can no longer get stuck on after rapid toggles.** The OS
+  color-filter change is now applied on a single serialized worker so the most
+  recent request always wins, instead of detached threads that could finish
+  out of order and leave the display in the wrong state.
+- **Settings status messages could be invisible.** They rendered at the top
+  of the Settings page, so any message triggered while scrolled down -
+  export, backup and restore, and the update check - appeared off-screen.
+  They now show as a fixed bottom-center toast that is always visible and
+  linger a little longer.
+
+### Internal
+- Added a regression test proving an in-place upgrade from an old (v0.1.0-era)
+  database preserves all existing data while gaining the new columns, tables,
+  and settings - so updating the app never loses your history.
 
 ## [0.3.0] - 2026-06-13 - Productivity tools, personalization, and data safety
 

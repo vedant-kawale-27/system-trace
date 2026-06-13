@@ -12,8 +12,10 @@
 pub mod blocker;
 pub mod collector;
 pub mod commands;
+pub mod crypto;
 pub mod db;
 pub mod grayscale;
+pub mod icon;
 pub mod models;
 pub mod platform;
 pub mod state;
@@ -24,6 +26,40 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+
+/// Undo any bedtime grayscale we applied, so a best-effort OS change (notably
+/// the Linux GTK theme swap) does not outlive the app. Called from every exit
+/// path - the tray Quit item and the event-loop `Exit` event - because
+/// `RunEvent::Exit` is not guaranteed to fire before the process dies on every
+/// platform (Windows `app.exit(0)` in particular). `set_grayscale(false)` is
+/// idempotent, so running it from both paths is harmless.
+fn revert_grayscale_if_applied(app: &tauri::AppHandle) {
+    if let Some(st) = app.try_state::<AppState>() {
+        let applied = st
+            .shared
+            .lock()
+            .map(|s| s.grayscale_applied)
+            .unwrap_or(false);
+        if applied {
+            let _ = grayscale::set_grayscale(false);
+        }
+    }
+}
+
+/// Persist a final encrypted snapshot of the in-memory database on the way out,
+/// so the most recent activity is saved. Idempotent and best-effort.
+fn snapshot_db_on_exit(app: &tauri::AppHandle) {
+    if let Some(st) = app.try_state::<AppState>() {
+        if let Some((path, key)) = &st.enc {
+            let guard = st.db.lock();
+            if let Ok(conn) = guard {
+                if let Err(e) = db::snapshot_encrypted(&conn, path, key) {
+                    log::warn!("final encrypted snapshot failed: {e}");
+                }
+            }
+        }
+    }
+}
 
 /// Build and run the System Trace desktop app.
 pub fn run() {
@@ -73,7 +109,19 @@ pub fn run() {
                 let _ = std::fs::remove_file(&db_path);
             }
 
-            let conn = db::open(&db_path).expect("failed to open database");
+            // Production keeps the live database in memory and writes only
+            // encrypted snapshots to disk, so no plaintext DB exists at rest.
+            // Test mode uses a plaintext file DB to keep the E2E harness simple
+            // (and free of the OS keyring).
+            let enc_path = dir.join("system-trace.enc");
+            let (conn, enc) = if is_test {
+                (db::open(&db_path).expect("failed to open database"), None)
+            } else {
+                let key = crypto::get_or_create_key(&dir.join("db.key"));
+                let conn =
+                    db::open_encrypted(&enc_path, &key, &db_path).expect("failed to open database");
+                (conn, Some((enc_path.clone(), key)))
+            };
 
             // In E2E test mode the database is fresh each run, which would
             // otherwise drop the app on the first-run onboarding screen and
@@ -108,12 +156,28 @@ pub fn run() {
                 settings.capture_titles,
                 tracking_paused,
             )));
+
+            // Persist the initial encrypted snapshot, then remove any legacy
+            // plaintext database we just migrated from so it no longer sits
+            // unencrypted on disk.
+            if let Some((ref path, ref key)) = enc {
+                if let Err(e) = db::snapshot_encrypted(&conn, path, key) {
+                    log::warn!("initial encrypted snapshot failed: {e}");
+                }
+                if db_path.exists() {
+                    let _ = std::fs::remove_file(&db_path);
+                    let _ = std::fs::remove_file(db_path.with_extension("sqlite-wal"));
+                    let _ = std::fs::remove_file(db_path.with_extension("sqlite-shm"));
+                }
+            }
+
             let db = Arc::new(Mutex::new(conn));
 
             app.manage(AppState {
                 db: db.clone(),
                 shared: shared.clone(),
                 db_path: db_path.clone(),
+                enc,
             });
 
             // Register the global pause/resume hotkey (default Ctrl+Alt+P).
@@ -125,9 +189,11 @@ pub fn run() {
                 };
                 let hotkey = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
                 let shared_for_key = shared.clone();
+                let db_for_key = db.clone();
                 let gs = app.global_shortcut();
                 let reg = gs.on_shortcut(hotkey, move |_app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
+                        let mut new_paused = None;
                         if let Ok(mut s) = shared_for_key.lock() {
                             s.paused = !s.paused;
                             s.state = if s.paused {
@@ -138,11 +204,28 @@ pub fn run() {
                             if s.paused {
                                 s.active_app = None;
                             }
+                            new_paused = Some(s.paused);
+                        }
+                        // Persist so the pause state survives a restart, exactly
+                        // like toggling it from the Settings UI does.
+                        if let Some(paused) = new_paused {
+                            if let Ok(conn) = db_for_key.lock() {
+                                let _ = db::set_setting(
+                                    &conn,
+                                    "tracking_paused",
+                                    if paused { "true" } else { "false" },
+                                );
+                            }
                         }
                     }
                 });
                 if let Err(e) = reg {
                     log::warn!("could not register pause hotkey: {e}");
+                    // Surface the failure so Settings can show the chord as
+                    // unavailable instead of looking dead.
+                    if let Ok(mut s) = shared.lock() {
+                        s.hotkey_registered = false;
+                    }
                 }
             }
 
@@ -173,7 +256,11 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        snapshot_db_on_exit(app);
+                        revert_grayscale_if_applied(app);
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .build(app)?;
@@ -203,6 +290,10 @@ pub fn run() {
             commands::set_category_goal,
             commands::remove_category_goal,
             commands::get_goal_streaks,
+            commands::get_app_goals,
+            commands::set_app_goal,
+            commands::remove_app_goal,
+            commands::get_app_icon,
             commands::search_usage,
             commands::save_focus_session,
             commands::list_focus_sessions,
@@ -234,7 +325,18 @@ pub fn run() {
             commands::get_focus_state,
             commands::apply_website_block,
             commands::clear_website_block,
+            commands::get_hotkey_status,
+            commands::focus_main_window,
+            commands::save_report_pdf,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running System Trace");
+        .build(tauri::generate_context!())
+        .expect("error while building System Trace")
+        .run(|app_handle, event| {
+            // Backstop for exit paths other than the tray Quit item (which
+            // already reverts before calling app.exit). Idempotent.
+            if let tauri::RunEvent::Exit = event {
+                snapshot_db_on_exit(app_handle);
+                revert_grayscale_if_applied(app_handle);
+            }
+        });
 }

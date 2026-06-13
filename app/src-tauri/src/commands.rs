@@ -56,6 +56,45 @@ pub fn remove_category_goal(state: State<AppState>, category_id: i64) -> R<()> {
 }
 
 #[tauri::command]
+pub fn get_app_goals(state: State<AppState>) -> R<Vec<AppGoal>> {
+    let conn = lock(&state.db)?;
+    db::get_app_goals(&conn)
+}
+
+/// The app's real OS icon as raw RGBA pixels, if we know its path and can
+/// extract one. The frontend caches the result and falls back to a letter
+/// avatar when this is `None`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_app_icon(state: State<AppState>, app_key: String) -> R<Option<AppIcon>> {
+    let path = {
+        let conn = lock(&state.db)?;
+        db::get_app_path(&conn, &app_key)?
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    Ok(
+        crate::icon::extract_icon_rgba(&path).map(|(width, height, rgba)| AppIcon {
+            width,
+            height,
+            rgba,
+        }),
+    )
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_app_goal(state: State<AppState>, goal: AppGoalInput) -> R<()> {
+    let conn = lock(&state.db)?;
+    db::set_app_goal(&conn, &goal)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn remove_app_goal(state: State<AppState>, app_id: i64) -> R<()> {
+    let conn = lock(&state.db)?;
+    db::remove_app_goal(&conn, app_id)
+}
+
+#[tauri::command]
 pub fn get_focus_score(state: State<AppState>) -> R<FocusScore> {
     let conn = lock(&state.db)?;
     let day = Utc::now()
@@ -180,30 +219,44 @@ pub fn import_data(state: State<AppState>, path: String) -> R<ImportResult> {
 
 #[tauri::command]
 pub fn wipe_all_data(state: State<AppState>) -> R<WipeResult> {
-    let conn = lock(&state.db)?;
-    db::wipe_all_data(&conn)
+    let result = {
+        let conn = lock(&state.db)?;
+        let r = db::wipe_all_data(&conn)?;
+        // Immediately overwrite the encrypted snapshot so the wiped data is
+        // gone from disk too, not just from the in-memory database.
+        if let Some((path, key)) = &state.enc {
+            let _ = db::snapshot_encrypted(&conn, path, key);
+        }
+        r
+    };
+    Ok(result)
 }
 
-/// Copy the live SQLite file to a user-chosen path. We checkpoint the WAL first
-/// so the backup is a complete, self-contained database.
+/// Write a consistent snapshot of the live database to a user-chosen path using
+/// SQLite's online backup API. This is atomic with respect to other writers on
+/// the same connection (we hold the lock), so the collector cannot slip a write
+/// in between a checkpoint and a file copy the way a raw `fs::copy` allowed.
 #[tauri::command(rename_all = "snake_case")]
 pub fn backup_database(state: State<AppState>, path: String) -> R<BackupResult> {
     {
         let conn = lock(&state.db)?;
-        // Fold the WAL back into the main file so the copy is consistent.
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        conn.backup(rusqlite::DatabaseName::Main, &path, None)
+            .map_err(|e| e.to_string())?;
     }
-    let bytes = std::fs::copy(&state.db_path, &path).map_err(|e| e.to_string())? as i64;
+    let bytes = std::fs::metadata(&path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
     Ok(BackupResult { path, bytes })
 }
 
-/// Restore the database from a backup file. The app must be restarted afterward
-/// because the live connection still points at the old file contents; we report
-/// success and the UI tells the user to relaunch.
+/// Restore the database from a backup file using SQLite's online restore API,
+/// straight into the live connection. Because the data is copied page-by-page
+/// into the open database (rather than replacing the file under an open handle),
+/// it is safe and takes effect immediately - no restart, no corruption.
 #[tauri::command(rename_all = "snake_case")]
 pub fn restore_database(state: State<AppState>, path: String) -> R<()> {
-    // Basic sanity: the file should be a SQLite database (starts with the magic
-    // header) so we don't clobber the live DB with garbage.
+    // Basic sanity: the file must be a SQLite database (magic header) so we do
+    // not feed garbage into the restore.
     let header = {
         let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
         use std::io::Read;
@@ -214,16 +267,18 @@ pub fn restore_database(state: State<AppState>, path: String) -> R<()> {
     if &header[..15] != b"SQLite format 3" {
         return Err("That file is not a System Trace backup.".into());
     }
-    // Drop the WAL/SHM siblings so the restored main file is authoritative.
-    let wal = state.db_path.with_extension("sqlite-wal");
-    let shm = state.db_path.with_extension("sqlite-shm");
-    {
-        let conn = lock(&state.db)?;
-        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-    }
-    std::fs::copy(&path, &state.db_path).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(wal);
-    let _ = std::fs::remove_file(shm);
+
+    // Hold the lock for the whole restore so the collector cannot write mid-copy.
+    let mut conn = lock(&state.db)?;
+    conn.restore(
+        rusqlite::DatabaseName::Main,
+        &path,
+        None::<fn(rusqlite::backup::Progress)>,
+    )
+    .map_err(|e| e.to_string())?;
+    // The backup may be from an older version; bring its schema up to date so
+    // newer columns, tables, and settings exist.
+    db::migrate(&conn)?;
     Ok(())
 }
 
@@ -274,6 +329,38 @@ pub fn get_collector_state(state: State<AppState>) -> R<CollectorState> {
     Ok(lock(&state.shared)?.state)
 }
 
+/// Whether the global pause/resume hotkey registered at startup. False means
+/// another process already owns Ctrl+Alt+P; the UI shows the chord as
+/// unavailable instead of letting it look broken.
+#[tauri::command]
+pub fn get_hotkey_status(state: State<AppState>) -> R<bool> {
+    Ok(lock(&state.shared)?.hotkey_registered)
+}
+
+/// Bring the main window to the foreground. Called when the user clicks one of
+/// our OS notifications (the frontend registers a notification-action handler)
+/// so a reminder always opens the app instead of doing nothing - and works the
+/// same on every platform.
+#[tauri::command]
+pub fn focus_main_window(app: tauri::AppHandle) -> R<()> {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+    Ok(())
+}
+
+/// Write raw bytes (a PDF the frontend generated) to a user-chosen path. The
+/// path comes from the native save dialog, so this only ever writes where the
+/// user explicitly pointed it.
+#[tauri::command(rename_all = "snake_case")]
+pub fn save_report_pdf(path: String, bytes: Vec<u8>) -> R<i64> {
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(bytes.len() as i64)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub fn set_tracking_paused(state: State<AppState>, paused: bool) -> R<CollectorState> {
     {
@@ -289,6 +376,11 @@ pub fn set_tracking_paused(state: State<AppState>, paused: bool) -> R<CollectorS
     if paused {
         s.state = CollectorState::Paused;
         s.active_app = None;
+    } else {
+        // Resuming: reflect a non-paused state immediately so the Topbar button
+        // flips to "Pause" right away. The collector refines this to
+        // Active / Idle / Locked on its next loop and the usage_tick event.
+        s.state = CollectorState::Idle;
     }
     Ok(s.state)
 }
