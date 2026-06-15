@@ -140,6 +140,7 @@ To track the active window on Wayland, two main approaches were evaluated:
 1. **GNOME Shell**:
    - First checks the `org.gnome.Shell.extensions.FocusedWindow` D-Bus extension (a popular user extension exposing the focused window metadata).
    - If not installed, falls back to `org.gnome.Shell.Eval` D-Bus method to execute a private JavaScript snippet to query the active window class and title. Note that `Eval` is restricted on GNOME 41+ unless "unsafe mode" is explicitly enabled.
+   - **Known Limitations**: On a stock, out-of-the-box GNOME Wayland session (e.g. default Fedora or Ubuntu setups) without the `FocusedWindow` extension, `active_window()` will return `None` (resulting in no active window tracking). Tracking works when the extension is active, or on KDE Plasma.
    
 2. **KDE Plasma (KWin)**:
    - On watcher startup, the application registers a local D-Bus receiver (`org.system_trace.Receiver`).

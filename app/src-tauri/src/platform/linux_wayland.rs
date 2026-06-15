@@ -6,9 +6,9 @@
 #![cfg(target_os = "linux")]
 
 use super::{ActiveWindow, Watcher};
+use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use zbus::blocking::Proxy;
-use serde::Deserialize;
 
 pub trait WaylandWindowFetcher: Send {
     fn fetch_active_window(&mut self) -> Option<ActiveWindow>;
@@ -90,7 +90,7 @@ impl WaylandWindowFetcher for DbusWaylandWindowFetcher {
             }
             "kde" => {
                 // KDE: read from the shared State updated by the KWin script callback
-                self.kde_active.lock().unwrap().clone()
+                self.kde_active.lock().ok().and_then(|guard| guard.clone())
             }
             _ => None,
         }
@@ -106,13 +106,14 @@ pub struct ActiveWindowReceiver {
 impl ActiveWindowReceiver {
     #[zbus(name = "UpdateActiveWindow")]
     fn update_active_window(&self, app_key: String, title: String) {
-        let mut active = self.active.lock().unwrap();
-        *active = Some(ActiveWindow {
-            app_name: app_key.clone(),
-            app_key,
-            title: if title.is_empty() { None } else { Some(title) },
-            app_path: None,
-        });
+        if let Ok(mut active) = self.active.lock() {
+            *active = Some(ActiveWindow {
+                app_name: app_key.clone(),
+                app_key,
+                title: if title.is_empty() { None } else { Some(title) },
+                app_path: None,
+            });
+        }
     }
 }
 
@@ -128,15 +129,24 @@ impl WaylandWatcher {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP")
             .unwrap_or_default()
             .to_lowercase();
-        
+
         let mut conn_opt = None;
         let mut fetcher: Box<dyn WaylandWindowFetcher> = Box::new(NullWaylandWindowFetcher);
         let kde_active = Arc::new(Mutex::new(None));
 
         if desktop.contains("gnome") || desktop.contains("kde") {
-            let receiver = ActiveWindowReceiver { active: kde_active.clone() };
-            let conn_res = zbus::blocking::connection::Builder::session()
-                .and_then(|b| b.name("org.system_trace.Receiver")?.serve_at("/org/system_trace/Receiver", receiver)?.build());
+            let conn_res = if desktop.contains("kde") {
+                let receiver = ActiveWindowReceiver {
+                    active: kde_active.clone(),
+                };
+                zbus::blocking::connection::Builder::session().and_then(|b| {
+                    b.name("org.system_trace.Receiver")?
+                        .serve_at("/org/system_trace/Receiver", receiver)?
+                        .build()
+                })
+            } else {
+                zbus::blocking::Connection::session()
+            };
 
             match conn_res {
                 Ok(conn) => {
@@ -150,7 +160,11 @@ impl WaylandWatcher {
 
                     fetcher = Box::new(DbusWaylandWindowFetcher {
                         conn: Some(conn.clone()),
-                        desktop: if desktop.contains("kde") { "kde".to_string() } else { "gnome".to_string() },
+                        desktop: if desktop.contains("kde") {
+                            "kde".to_string()
+                        } else {
+                            "gnome".to_string()
+                        },
                         kde_active,
                     });
                     conn_opt = Some(conn);
@@ -177,12 +191,7 @@ impl WaylandWatcher {
 }
 
 fn setup_kwin_script(conn: &zbus::blocking::Connection) -> Result<(), Box<dyn std::error::Error>> {
-    let scripting_proxy = Proxy::new(
-        conn,
-        "org.kde.KWin",
-        "/Scripting",
-        "org.kde.kwin.Scripting",
-    )?;
+    let scripting_proxy = Proxy::new(conn, "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")?;
 
     // Unload any previously loaded script of the same name to prevent naming conflicts
     let _: Result<(), _> = scripting_proxy.call("unloadScript", &("system_trace_watcher",));
@@ -214,20 +223,19 @@ fn setup_kwin_script(conn: &zbus::blocking::Connection) -> Result<(), Box<dyn st
     std::fs::write(&temp_file, script_content)?;
 
     let script_path_str = temp_file.to_string_lossy().to_string();
-    let script_obj_path: zbus::zvariant::OwnedObjectPath = scripting_proxy.call(
-        "loadScript",
-        &(script_path_str, "system_trace_watcher"),
-    )?;
+    let script_obj_path: zbus::zvariant::OwnedObjectPath =
+        scripting_proxy.call("loadScript", &(script_path_str, "system_trace_watcher"))?;
 
-    let script_proxy = Proxy::new(
-        conn,
-        "org.kde.KWin",
-        script_obj_path,
-        "org.kde.kwin.Script",
-    )?;
-    script_proxy.call("run", &())?;
+    let script_proxy = Proxy::new(conn, "org.kde.KWin", script_obj_path, "org.kde.kwin.Script")?;
+    let _: () = script_proxy.call("run", &())?;
 
     let _ = std::fs::remove_file(temp_file);
+    Ok(())
+}
+
+fn unload_kwin_script(conn: &zbus::blocking::Connection) -> Result<(), Box<dyn std::error::Error>> {
+    let scripting_proxy = Proxy::new(conn, "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")?;
+    let _: Result<(), _> = scripting_proxy.call("unloadScript", &("system_trace_watcher",));
     Ok(())
 }
 
@@ -257,12 +265,12 @@ impl Watcher for WaylandWatcher {
             }
         }
         // Under KDE and other desktop environments, we lack a stable public D-Bus idle monitor.
-        // Returning 0 counts the user as active as long as there is an active window.
-        0
+        // Returning u64::MAX counts the user as idle so that the collector stops accumulating when away.
+        u64::MAX
     }
 
     fn is_media_playing(&mut self) -> bool {
-        super::is_alsa_media_playing()
+        super::linux::is_alsa_media_playing()
     }
 
     fn session_locked(&mut self) -> bool {
@@ -284,6 +292,19 @@ impl Watcher for WaylandWatcher {
 
     fn set_capture_titles(&mut self, on: bool) {
         self.capture_titles = on;
+    }
+}
+
+impl Drop for WaylandWatcher {
+    fn drop(&mut self) {
+        if self.desktop == "kde" {
+            if let Some(conn) = &self.conn {
+                log::info!("WaylandWatcher drop: unloading KWin script");
+                if let Err(e) = unload_kwin_script(conn) {
+                    log::error!("Failed to unload KWin script on drop: {:?}", e);
+                }
+            }
+        }
     }
 }
 

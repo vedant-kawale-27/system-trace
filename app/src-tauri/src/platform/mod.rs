@@ -54,9 +54,9 @@ pub use macos::MacWatcher as PlatformWatcher;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-mod linux_x11;
-#[cfg(target_os = "linux")]
 mod linux_wayland;
+#[cfg(target_os = "linux")]
+mod linux_x11;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxWatcher as PlatformWatcher;
 

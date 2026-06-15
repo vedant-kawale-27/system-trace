@@ -134,37 +134,6 @@ impl Watcher for X11Watcher {
     }
 
     fn is_media_playing(&mut self) -> bool {
-        // Best-effort and dependency-free: ALSA exposes a per-substream status
-        // file under /proc/asound. A playback substream reads "RUNNING" while
-        // audio is actually flowing, so we scan the playback ("pcm*p") streams.
-        // This catches PipeWire/Pulse output too, since they sit on top of ALSA.
-        use std::fs;
-        let Ok(cards) = fs::read_dir("/proc/asound") else {
-            return false;
-        };
-        for card in cards.flatten() {
-            let Ok(pcms) = fs::read_dir(card.path()) else {
-                continue;
-            };
-            for pcm in pcms.flatten() {
-                let name = pcm.file_name();
-                let name = name.to_string_lossy();
-                // Playback devices are named like "pcm0p".
-                if !(name.starts_with("pcm") && name.ends_with('p')) {
-                    continue;
-                }
-                let Ok(subs) = fs::read_dir(pcm.path()) else {
-                    continue;
-                };
-                for sub in subs.flatten() {
-                    if let Ok(s) = fs::read_to_string(sub.path().join("status")) {
-                        if s.contains("RUNNING") {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
+        super::linux::is_alsa_media_playing()
     }
 }

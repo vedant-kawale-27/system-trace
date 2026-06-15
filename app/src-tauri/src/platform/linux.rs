@@ -4,9 +4,9 @@
 
 #![cfg(target_os = "linux")]
 
-use super::{ActiveWindow, Watcher};
 use super::linux_wayland::WaylandWatcher;
 use super::linux_x11::X11Watcher;
+use super::{ActiveWindow, Watcher};
 
 pub struct LinuxWatcher {
     inner: WatcherImpl,
