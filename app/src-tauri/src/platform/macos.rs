@@ -18,6 +18,11 @@ use std::os::raw::c_char;
 use cocoa::base::{id, nil};
 use objc::{class, msg_send, sel, sel_impl};
 
+use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::string::CFString;
+
 // Quartz event-source idle query. CGEventSourceStateID::CombinedSessionState = 0,
 // kCGAnyInputEventType = 0xFFFFFFFF.
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -56,6 +61,8 @@ extern "C" {
     ) -> CFStringRef;
     fn CFStringGetCStringPtr(s: CFStringRef, encoding: u32) -> *const c_char;
     fn CFStringGetCString(s: CFStringRef, buffer: *mut c_char, size: isize, encoding: u32) -> bool;
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: CFTypeRef) -> bool;
 }
 
 const KCF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
@@ -181,19 +188,6 @@ unsafe fn macos_audio_running() -> bool {
     status == 0 && running != 0
 }
 
-#[derive(Default)]
-pub struct MacWatcher {
-    capture_titles: bool,
-}
-
-impl MacWatcher {
-    pub fn new() -> Self {
-        MacWatcher {
-            capture_titles: false,
-        }
-    }
-}
-
 /// Convert an NSString to a Rust String (empty when null).
 unsafe fn nsstring_to_string(ns: id) -> Option<String> {
     if ns == nil {
@@ -211,8 +205,30 @@ unsafe fn nsstring_to_string(ns: id) -> Option<String> {
     }
 }
 
-impl Watcher for MacWatcher {
-    fn active_window(&mut self) -> Option<ActiveWindow> {
+pub trait MacPlatformHelper: Send {
+    fn is_trusted(&self) -> bool;
+    fn request_permission(&self) -> bool;
+    fn frontmost_app_info(&self) -> Option<(String, String, Option<String>, i32)>;
+    fn ax_window_title(&self, pid: i32) -> Option<String>;
+}
+
+pub struct RealMacPlatformHelper;
+
+impl MacPlatformHelper for RealMacPlatformHelper {
+    fn is_trusted(&self) -> bool {
+        unsafe { AXIsProcessTrusted() }
+    }
+
+    fn request_permission(&self) -> bool {
+        unsafe {
+            let key = CFString::from_static_string("AXTrustedCheckOptionPrompt");
+            let value = CFBoolean::true_value();
+            let dict = CFDictionary::from_CFType_pairs(&[(key, value.as_CFType())]);
+            AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef() as CFTypeRef)
+        }
+    }
+
+    fn frontmost_app_info(&self) -> Option<(String, String, Option<String>, i32)> {
         unsafe {
             let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
             if workspace == nil {
@@ -228,8 +244,6 @@ impl Watcher for MacWatcher {
             let app_key = nsstring_to_string(bundle)
                 .or_else(|| app_name.clone())
                 .unwrap_or_else(|| "unknown".to_string());
-            // Resolve the .app bundle path (best-effort) so the UI can pull a
-            // real icon from it.
             let app_path = {
                 let url: id = msg_send![app, bundleURL];
                 if url == nil {
@@ -239,23 +253,61 @@ impl Watcher for MacWatcher {
                     nsstring_to_string(p)
                 }
             };
-            // Frontmost window title via the Accessibility API - only when the
-            // user enabled title capture, since the AX round-trip is relatively
-            // expensive to do every tick (and prompts/denies without the
-            // Accessibility permission).
-            let title = if self.capture_titles {
-                let pid: i32 = msg_send![app, processIdentifier];
-                ax_window_title(pid)
-            } else {
-                None
-            };
-            Some(ActiveWindow {
-                app_name: app_name.unwrap_or_else(|| app_key.clone()),
-                app_key,
-                title,
-                app_path,
-            })
+            let pid: i32 = msg_send![app, processIdentifier];
+            let display_name = app_name.unwrap_or_else(|| app_key.clone());
+            Some((app_key, display_name, app_path, pid))
         }
+    }
+
+    fn ax_window_title(&self, pid: i32) -> Option<String> {
+        unsafe { ax_window_title(pid) }
+    }
+}
+
+pub struct MacWatcher {
+    capture_titles: bool,
+    helper: Box<dyn MacPlatformHelper>,
+}
+
+impl MacWatcher {
+    pub fn new() -> Self {
+        MacWatcher {
+            capture_titles: false,
+            helper: Box::new(RealMacPlatformHelper),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_helper(helper: Box<dyn MacPlatformHelper>) -> Self {
+        MacWatcher {
+            capture_titles: false,
+            helper,
+        }
+    }
+}
+
+impl Default for MacWatcher {
+    fn default() -> Self {
+        MacWatcher::new()
+    }
+}
+
+impl Watcher for MacWatcher {
+    fn active_window(&mut self) -> Option<ActiveWindow> {
+        let (app_key, app_name, app_path, pid) = self.helper.frontmost_app_info()?;
+
+        let title = if self.capture_titles && self.helper.is_trusted() {
+            self.helper.ax_window_title(pid)
+        } else {
+            None
+        };
+
+        Some(ActiveWindow {
+            app_name,
+            app_key,
+            title,
+            app_path,
+        })
     }
 
     fn idle_ms(&mut self) -> u64 {
@@ -296,6 +348,108 @@ impl Watcher for MacWatcher {
     }
 
     fn set_capture_titles(&mut self, on: bool) {
+        if on && !self.capture_titles {
+            // Check if trusted, and if not, request permission (prompt the user)
+            if !self.helper.is_trusted() {
+                self.helper.request_permission();
+            }
+        }
         self.capture_titles = on;
+    }
+}
+
+#[cfg(test)]
+pub struct FakeMacPlatformHelper {
+    pub trusted: bool,
+    pub permission_requested: std::sync::atomic::AtomicBool,
+    pub frontmost_app: Option<(String, String, Option<String>, i32)>,
+    pub window_title: Option<String>,
+}
+
+#[cfg(test)]
+impl MacPlatformHelper for FakeMacPlatformHelper {
+    fn is_trusted(&self) -> bool {
+        self.trusted
+    }
+
+    fn request_permission(&self) -> bool {
+        self.permission_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    fn frontmost_app_info(&self) -> Option<(String, String, Option<String>, i32)> {
+        self.frontmost_app.clone()
+    }
+
+    fn ax_window_title(&self, _pid: i32) -> Option<String> {
+        self.window_title.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_mac_watcher_gating_and_permission() {
+        let helper = Box::new(FakeMacPlatformHelper {
+            trusted: false,
+            permission_requested: std::sync::atomic::AtomicBool::new(false),
+            frontmost_app: Some((
+                "com.apple.Safari".to_string(),
+                "Safari".to_string(),
+                Some("/Applications/Safari.app".to_string()),
+                1234,
+            )),
+            window_title: Some("Apple".to_string()),
+        });
+
+        // Pointer to the permission_requested AtomicBool so we can assert on it.
+        let permission_requested_ptr =
+            unsafe { &*(&helper.permission_requested as *const std::sync::atomic::AtomicBool) };
+
+        let mut watcher = MacWatcher::with_helper(helper);
+
+        // 1. Gating test: when capture_titles is false, active_window returns no title,
+        // and set_capture_titles(false) doesn't request permission.
+        watcher.set_capture_titles(false);
+        let active = watcher.active_window().unwrap();
+        assert_eq!(active.app_key, "com.apple.Safari");
+        assert_eq!(active.title, None);
+        assert!(!permission_requested_ptr.load(Ordering::SeqCst));
+
+        // 2. Permission request on transition test: when setting capture_titles to true
+        // (and it is not trusted), it should request permission.
+        watcher.set_capture_titles(true);
+        assert!(permission_requested_ptr.load(Ordering::SeqCst));
+
+        // 3. Graceful degradation: since it is not trusted, active_window still returns None for title
+        let active_untrusted = watcher.active_window().unwrap();
+        assert_eq!(active_untrusted.title, None);
+    }
+
+    #[test]
+    fn test_mac_watcher_trusted_title() {
+        let helper = Box::new(FakeMacPlatformHelper {
+            trusted: true,
+            permission_requested: std::sync::atomic::AtomicBool::new(false),
+            frontmost_app: Some((
+                "com.apple.Safari".to_string(),
+                "Safari".to_string(),
+                Some("/Applications/Safari.app".to_string()),
+                1234,
+            )),
+            window_title: Some("Apple".to_string()),
+        });
+
+        let mut watcher = MacWatcher::with_helper(helper);
+        watcher.set_capture_titles(true);
+
+        // When trusted, active_window returns the captured title.
+        let active = watcher.active_window().unwrap();
+        assert_eq!(active.app_key, "com.apple.Safari");
+        assert_eq!(active.title.as_deref(), Some("Apple"));
     }
 }
