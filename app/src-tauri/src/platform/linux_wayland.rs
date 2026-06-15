@@ -308,10 +308,12 @@ impl Drop for WaylandWatcher {
     }
 }
 
+#[cfg(test)]
 pub struct FakeWaylandWindowFetcher {
     pub active: Option<ActiveWindow>,
 }
 
+#[cfg(test)]
 impl WaylandWindowFetcher for FakeWaylandWindowFetcher {
     fn fetch_active_window(&mut self) -> Option<ActiveWindow> {
         self.active.clone()

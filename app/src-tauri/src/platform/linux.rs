@@ -13,8 +13,8 @@ pub struct LinuxWatcher {
 }
 
 enum WatcherImpl {
-    X11(X11Watcher),
-    Wayland(WaylandWatcher),
+    X11(Box<X11Watcher>),
+    Wayland(Box<WaylandWatcher>),
 }
 
 impl Default for LinuxWatcher {
@@ -28,10 +28,10 @@ impl LinuxWatcher {
         let is_wayland = detect_session_type() == "wayland";
         let inner = if is_wayland {
             log::info!("Wayland session detected, starting WaylandWatcher");
-            WatcherImpl::Wayland(WaylandWatcher::new())
+            WatcherImpl::Wayland(Box::new(WaylandWatcher::new()))
         } else {
             log::info!("X11 session detected, starting X11Watcher");
-            WatcherImpl::X11(X11Watcher::new())
+            WatcherImpl::X11(Box::new(X11Watcher::new()))
         };
         LinuxWatcher { inner }
     }
